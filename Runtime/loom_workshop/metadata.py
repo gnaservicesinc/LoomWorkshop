@@ -80,6 +80,8 @@ def current_category(path, manifest):
     """Current Factory tags are authoritative; classifiers fill only absent tags."""
     catalog = {category["id"] for category in manifest["categories"]}
     factory = read_tag(path, FACTORY_KEY)
+    if factory and factory.get("ignored", False):
+        raise ValueError("This image was ignored in Loom Factory. Refresh the source folder.")
     factory_category = factory_category_id(factory) if factory else None
     factory_name = ((factory or {}).get("category") or "").strip() or None
     if factory_category:
@@ -107,6 +109,8 @@ def prepare_membership(samples):
             raise ValueError("An image's identity metadata changed. Refresh the source folder before training.")
         pair_id = (factory_input or {}).get("pairingKey") or (input_tag or {}).get("pairID") or "pair-" + sample["id"]
         fields = [(input_path, "diffuse")] + [(path, role) for role, path in sample.get("targets", {}).items()]
+        if "normal" in sample.get("targets", {}) and sample.get("normal_convention", "opengl").lower() == "directx":
+            raise ValueError("DirectX normal maps are excluded from training.")
         for path, role in fields:
             if role not in ("diffuse", "depth", "roughness", "normal"):
                 raise ValueError("Choose a supported diffuse, depth, roughness or normal map role.")
@@ -118,7 +122,11 @@ def prepare_membership(samples):
             tag = read_tag(path, WORKSHOP_KEY)
             active = factory or tag
             if active:
+                if active.get("ignored", False):
+                    raise ValueError(f"This image was ignored in Loom Factory: {Path(path).name}")
                 actual_role = active.get("role")
+                if role == "normal" and (active.get("normalConvention") or "opengl").lower() == "directx":
+                    raise ValueError("DirectX normal maps are excluded from training.")
                 actual_pair = active.get("pairingKey") if factory else active.get("pairID")
                 if actual_role != role or actual_pair != pair_id:
                     raise ValueError(f"A map's current image metadata no longer matches its pair: {Path(path).name}")
@@ -150,7 +158,7 @@ def membership_signature(path):
         if tag is None:
             result.append(None)
         elif key == FACTORY_KEY:
-            result.append({name: tag.get(name) for name in ("id", "pairingKey", "role", "category", "verified", "normalConvention")})
+            result.append({name: tag.get(name) for name in ("id", "pairingKey", "role", "category", "verified", "normalConvention", "ignored")})
         else:
             result.append({name: tag.get(name) for name in ("id", "pairID", "role", "categoryID", "baseID", "baseVersion", "classifiedBytes", "classifiedModified", "factoryCategory", "normalConvention")})
     return result

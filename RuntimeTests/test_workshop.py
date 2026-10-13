@@ -17,7 +17,59 @@ from loom_workshop.base_models import MaterialMapNetwork
 from loom_workshop.engine import Cancellation, Cancelled, train
 from loom_workshop.lora import adapter_weights, attach_lora, frozen_base_weights, fuse_lora
 from loom_workshop.package import file_sha, load_base
-from loom_workshop.metadata import FACTORY_KEY, WORKSHOP_KEY, read_tag, write_tag, set_raw_tag
+from loom_workshop.metadata import FACTORY_KEY, WORKSHOP_KEY, read_tag, write_tag, set_raw_tag, prepare_membership
+
+
+class BumpMembershipTests(unittest.TestCase):
+    def test_bump_cannot_be_a_depth_target_and_ignored_metadata_stops_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            diffuse, bump = root / "diffuse.png", root / "bump.png"
+            for path, role in ((diffuse, "diffuse"), (bump, "bump")):
+                path.write_bytes(b"original image bytes")
+                write_tag(path, {"id": "bark" if role == "diffuse" else "bark-bump", "pairID": "bark-pair", "role": role})
+            sample = {"id": "bark", "input": str(diffuse), "targets": {"depth": str(bump)}}
+            with self.assertRaisesRegex(ValueError, "no longer matches"):
+                prepare_membership([sample])
+            write_tag(bump, {"id": "bark-bump", "pairID": "bark-pair", "role": "depth"})
+            prepare_membership([sample])
+            set_raw_tag(bump, FACTORY_KEY, json.dumps({"id": "bark-bump", "pairingKey": "bark-pair", "role": "depth", "ignored": True}).encode())
+            with self.assertRaisesRegex(ValueError, "ignored"):
+                prepare_membership([sample])
+
+
+class NormalConventionMembershipTests(unittest.TestCase):
+    def test_current_factory_or_workshop_directx_target_is_rejected_without_an_ignore_flag(self):
+        for key in (FACTORY_KEY, WORKSHOP_KEY):
+            for convention in ("directx", "DirectX", "DIRECTX"):
+                with self.subTest(metadata=key, convention=convention), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    diffuse, normal = root / "diffuse.png", root / "normal.png"
+                    diffuse.write_bytes(b"diffuse image bytes"); normal.write_bytes(b"normal image bytes")
+                    input_tag = {"id": "material", "pairID": "material-pair", "role": "diffuse"}
+                    normal_tag = {"id": "material-normal", "role": "normal", "normalConvention": "opengl", "ignored": False}
+                    normal_tag["pairingKey" if key == FACTORY_KEY else "pairID"] = "material-pair"
+                    write_tag(diffuse, input_tag)
+                    set_raw_tag(normal, key, json.dumps(normal_tag).encode())
+                    sample = {"id": "material", "input": str(diffuse), "targets": {"normal": str(normal)},
+                              "normal_convention": "opengl"}
+                    prepare_membership([sample])
+                    set_raw_tag(normal, key, json.dumps({**normal_tag, "normalConvention": convention}).encode())
+                    with self.assertRaisesRegex(ValueError, "DirectX normal maps are excluded"):
+                        prepare_membership([sample])
+                    self.assertEqual(normal.read_bytes(), b"normal image bytes")
+
+    def test_directx_request_is_rejected_before_new_image_tags_are_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            diffuse, normal = root / "diffuse.png", root / "normal.png"
+            diffuse.write_bytes(b"diffuse image bytes"); normal.write_bytes(b"normal image bytes")
+            sample = {"id": "material", "input": str(diffuse), "targets": {"normal": str(normal)},
+                      "normal_convention": "DirectX"}
+            with self.assertRaisesRegex(ValueError, "DirectX normal maps are excluded"):
+                prepare_membership([sample])
+            self.assertIsNone(read_tag(diffuse, WORKSHOP_KEY))
+            self.assertIsNone(read_tag(normal, WORKSHOP_KEY))
 
 
 class CreateMLClassifierConsumerTests(unittest.TestCase):

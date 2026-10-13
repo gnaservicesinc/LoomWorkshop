@@ -4,6 +4,8 @@ Loom Workshop trains a LoRA for the Texture Loom model built into your installed
 
 Choose Texture Studio, then a folder containing diffuse images with matching depth, roughness, or normal maps. The installed classifier groups the images into datasets automatically. Train one dataset or all available datasets, then export a `.loomlora` file or install it in Texture Studio.
 
+Known diffuse/color and map filenames are recognized automatically. Bump maps never substitute for depth, unrecognized files never default to diffuse, and normal training uses OpenGL maps. Files marked ignored in Loom Factory stay out of Workshop training.
+
 Texture Studio is checked in `/Applications` first. Choose its application bundle if it is installed elsewhere. That build must contain a complete Texture Loom package produced by Loom Factory; Workshop does not substitute another base model.
 
 Training settings, its Python environment, logs, and adapters stay under `.loom-workshop` in the chosen image folder. Image metadata preserves pair identity across renames. Changing the folder clears the active project; reopening a folder restores its settings. Original image pixels and the installed base weights are preserved.

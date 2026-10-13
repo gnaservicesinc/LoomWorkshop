@@ -29,6 +29,7 @@ private struct FactoryTag: Decodable {
     let category: String?
     let verified: Bool
     let normalConvention: String?
+    let ignored: Bool?
 }
 private let tagKey = "org.gnaservicesinc.loom-workshop.image.v1"
 private func metadataBytes(_ file: URL, key: String) -> Data? {
@@ -57,25 +58,45 @@ func identity(_ file: URL) throws -> (UInt64, TimeInterval) {
     let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
     return ((attributes[.size] as? NSNumber)?.uint64Value ?? 0, (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
 }
-private func filenameRole(_ file: URL) -> (String, String, String) {
+private func filenameRole(_ file: URL, legacy: Bool = false) -> (String, String, String) {
     var stem = file.deletingPathExtension().lastPathComponent.lowercased()
         .replacingOccurrences(of: "-", with: "_").replacingOccurrences(of: " ", with: "_")
-    let replacements: [(String, String, String)] = [
+    let diffusePattern = legacy ? "(?:^|_)(?:diff|diffuse|albedo|basecolor|color|col)(?=_|$)"
+        : "(?:^|_)(?:diff|diffuse|albedo|base_?(?:color|colour|col|colo)|color|colour|col|colo)(?=_|$)"
+    let normalPattern = legacy ? "(?:^|_)(?:nor|normal)(?=_|$)" : "(?:^|_)(?:nor|normal|normalgl)(?=_|$)"
+    var replacements: [(String, String, String)] = [
         ("(?:^|_)(?:nor|normal)_(?:dx|directx)(?=_|$)", "normal", "directx"),
         ("(?:^|_)(?:nor|normal)_(?:gl|opengl)(?=_|$)", "normal", "opengl"),
-        ("(?:^|_)(?:diff|diffuse|albedo|basecolor|color|col)(?=_|$)", "diffuse", "opengl"),
+        (diffusePattern, "diffuse", "opengl"),
         ("(?:^|_)(?:disp|displacement|depth|height)(?=_|$)", "depth", "opengl"),
         ("(?:^|_)(?:rough|roughness)(?=_|$)", "roughness", "opengl"),
-        ("(?:^|_)(?:nor|normal)(?=_|$)", "normal", "opengl"),
+        (normalPattern, "normal", "opengl"),
         ("(?:^|_)(?:ao|ambientocclusion|metal|metalness|metallic|spec|specular|opacity|alpha)(?=_|$)", "unknown", "opengl")]
-    for (pattern, role, convention) in replacements {
-        if stem.range(of: pattern, options: .regularExpression) != nil {
-            stem = stem.replacingOccurrences(of: pattern, with: "_", options: .regularExpression)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
-            return (role, stem, convention)
-        }
+    if !legacy {
+        replacements.append(("(?:^|_)(?:bump|bumpmap)(?=_|$)", "bump", "opengl"))
+        replacements.append(("(?:^|_)(?:normaldx)(?=_|$)", "normal", "directx"))
     }
-    return ("diffuse", stem, "opengl")
+    if legacy {
+        for (pattern, role, convention) in replacements where stem.range(of: pattern, options: .regularExpression) != nil {
+            let family = stem.replacingOccurrences(of: pattern, with: "_", options: .regularExpression)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+            return (role, family, convention)
+        }
+        return ("diffuse", stem, "opengl")
+    }
+    // Role words in a material's name must not override its map suffix.
+    let matches = replacements.compactMap { pattern, role, convention -> (Range<String.Index>, String, String)? in
+        guard let expression = try? NSRegularExpression(pattern: pattern),
+              let match = expression.matches(in: stem, range: NSRange(stem.startIndex..., in: stem)).last,
+              let range = Range(match.range, in: stem) else { return nil }
+        return (range, role, convention)
+    }
+    if let (range, role, convention) = matches.max(by: { $0.0.upperBound < $1.0.upperBound }) {
+        stem.replaceSubrange(range, with: "_")
+        stem = stem.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+        return (role, stem, convention)
+    }
+    return ("unknown", stem, "opengl")
 }
 private func digest(_ text: String) -> String { SHA256.hash(data: Data(text.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined() }
 private func physicalPath(_ file: URL) -> String {
@@ -116,6 +137,19 @@ func currentSamples(source: URL, studio: StudioBase, imageSize: Int) throws -> [
               (try? file.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true else { continue }
         let inferred = filenameRole(file)
         var tag = imageTag(file) ?? ImageTag(id: UUID().uuidString, pairID: "", role: inferred.0, normalConvention: inferred.2)
+        // Repair exact earlier filename inferences only. Renames, custom pairs
+        // and Factory's deliberate map-role decisions remain authoritative.
+        if metadataBytes(file, key: "com.gnaservicesinc.loomfactory.image.v1") == nil {
+            let folder = String(file.deletingLastPathComponent().standardizedFileURL.path.dropFirst(source.standardizedFileURL.path.count))
+            let previous = filenameRole(file, legacy: true)
+            let currentPair = "pair-" + digest(folder + "/" + inferred.1)
+            if tag.role == previous.0, tag.pairID == "pair-" + digest(folder + "/" + previous.1),
+               tag.role != inferred.0 || tag.pairID != currentPair {
+                tag.role = inferred.0; tag.pairID = currentPair; tag.normalConvention = inferred.2
+                tag.categoryID = nil; tag.baseID = nil; tag.baseVersion = nil
+                tag.classifiedBytes = nil; tag.classifiedModified = nil; tag.factoryCategory = nil
+            }
+        }
         if tag.pairID.isEmpty {
             let folder = String(file.deletingLastPathComponent().standardizedFileURL.path.dropFirst(source.standardizedFileURL.path.count))
             tag.pairID = "pair-" + digest(folder + "/" + inferred.1)
@@ -124,7 +158,11 @@ func currentSamples(source: URL, studio: StudioBase, imageSize: Int) throws -> [
         let current = try identity(file)
         if tag.baseID != studio.modelID || tag.baseVersion != studio.version || tag.classifiedBytes != current.0 || tag.classifiedModified != current.1 { tag.categoryID = nil }
         var currentFactoryCategory: String?
-        if let bytes = metadataBytes(file, key: "com.gnaservicesinc.loomfactory.image.v1"), let factory = try? JSONDecoder().decode(FactoryTag.self, from: bytes) {
+        if let bytes = metadataBytes(file, key: "com.gnaservicesinc.loomfactory.image.v1") {
+            guard let factory = try? JSONDecoder().decode(FactoryTag.self, from: bytes) else {
+                throw WorkshopError("Loom Factory metadata could not be read for \(file.lastPathComponent). Review this file in Loom Factory before training.")
+            }
+            if factory.ignored == true { continue }
             tag.pairID = factory.pairingKey
             tag.role = factory.role
             tag.normalConvention = factory.normalConvention ?? inferred.2
@@ -159,16 +197,21 @@ func currentSamples(source: URL, studio: StudioBase, imageSize: Int) throws -> [
         if let dimensions = imageDimensions(input), dimensions.0 >= imageSize, dimensions.1 >= imageSize {
             for role in ["depth", "roughness", "normal"] {
                 let candidates = members.filter { candidate in
-                    guard candidate.1.role == role, let targetSize = imageDimensions(candidate.0) else { return false }
+                    guard candidate.1.role == role, role != "normal" || candidate.2.lowercased() != "directx",
+                          let targetSize = imageDimensions(candidate.0) else { return false }
                     if let inputCategory = tag.categoryID, let targetCategory = candidate.1.categoryID, inputCategory != targetCategory { return false }
                     return targetSize == dimensions
                 }.sorted { $0.2 == "opengl" && $1.2 != "opengl" }
                 let sameConvention = candidates.filter { $0.2 == (candidates.first?.2 ?? "opengl") }
                 guard sameConvention.count <= 1 else { throw WorkshopError("More than one \(role) map belongs to \(input.lastPathComponent). Keep one matching map for each target.") }
-                if let (target, _, normal) = candidates.first { targets[role] = target; if role == "normal" { convention = normal } }
+                if let (target, _, normal) = candidates.first {
+                    targets[role] = target
+                    if role == "normal" { convention = normal }
+                }
             }
         }
-        samples.append(WorkshopSample(id: tag.id, input: input, targets: targets, categoryID: tag.categoryID, normalConvention: convention))
+        samples.append(WorkshopSample(id: tag.id, input: input, targets: targets,
+                                      categoryID: tag.categoryID, normalConvention: convention))
     }
     return samples.sorted { $0.input.path < $1.input.path }
 }

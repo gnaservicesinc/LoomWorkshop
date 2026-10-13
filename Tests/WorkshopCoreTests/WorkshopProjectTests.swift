@@ -89,6 +89,138 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(large.imageCount, 1); XCTAssertEqual(large.datasets.first?.pairedCounts["depth"], 0)
     }
 
+    func testBumpMapsAreInspectedSeparatelyAndNeverUsedForDepth() async throws {
+        let studio = try makeStudio(), source = try folder("Bump Sources")
+        let diffuse = source.appendingPathComponent("brick_diff_1k.png")
+        let bump = source.appendingPathComponent("brick_bump_1k.png")
+        let depth = source.appendingPathComponent("brick_disp_1k.png")
+        try image(diffuse); try image(bump); try image(depth)
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let state = try await project.snapshot(imageSize: 32)
+        let preferred = try currentSamples(source: source, studio: state.studio, imageSize: 32)
+        XCTAssertEqual(state.imageCount, 1); XCTAssertEqual(preferred.count, 1)
+        XCTAssertEqual(imageTag(bump)?.role, "bump")
+        XCTAssertEqual(imageTag(bump)?.pairID, imageTag(diffuse)?.pairID)
+        XCTAssertEqual(preferred.first?.targets["depth"], depth)
+        try FileManager.default.removeItem(at: depth)
+        let fallback = try currentSamples(source: source, studio: state.studio, imageSize: 32)
+        XCTAssertEqual(fallback.count, 1)
+        XCTAssertNil(fallback.first?.targets["depth"])
+        XCTAssertNil(fallback.first?.targets["roughness"])
+    }
+
+    func testLegacyDefaultPhotoRoleOnBumpRepairsWithoutRecategorizingTheSource() async throws {
+        let studio = try makeStudio(), source = try folder("Legacy Bump")
+        let diffuse = source.appendingPathComponent("brick_diff_1k.png")
+        let bump = source.appendingPathComponent("brick_bump_1k.png")
+        try image(diffuse); try image(bump)
+        let oldIdentity = "/brick_bump_1k"
+        let oldPair = "pair-" + SHA256.hash(data: Data(oldIdentity.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        let old = ImageTag(id: "preserved-bump-id", pairID: oldPair, role: "diffuse", categoryID: "old-incorrect-category")
+        try writeTag(old, to: bump)
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let state = try await project.snapshot(imageSize: 32)
+        XCTAssertEqual(state.imageCount, 1)
+        let repaired = try XCTUnwrap(imageTag(bump))
+        XCTAssertEqual(repaired.id, old.id); XCTAssertEqual(repaired.role, "bump")
+        XCTAssertEqual(repaired.pairID, imageTag(diffuse)?.pairID)
+        XCTAssertNil(repaired.categoryID)
+        let samples = try currentSamples(source: source, studio: state.studio, imageSize: 32)
+        XCTAssertNil(samples.first?.targets["depth"])
+    }
+
+    func testFactoryBumpMetadataSurvivesRenamesAndNeverBecomesADiffuse() async throws {
+        let studio = try makeStudio(), source = try folder("Renamed Bump")
+        let diffuse = source.appendingPathComponent("one.png"), bump = source.appendingPathComponent("two.png")
+        try image(diffuse); try image(bump)
+        try factoryTag(diffuse, role: "diffuse", category: "Bricks")
+        try factoryTag(bump, role: "bump", category: "Bricks")
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let state = try await project.snapshot(imageSize: 32)
+        let samples = try currentSamples(source: source, studio: state.studio, imageSize: 32)
+        XCTAssertEqual(state.imageCount, 1); XCTAssertEqual(state.datasets.first?.pairedCounts["depth"], 0)
+        XCTAssertNil(samples.first?.targets["depth"])
+        XCTAssertEqual(imageTag(bump)?.role, "bump")
+    }
+
+    func testFactoryIgnoredMapsAreExcludedWithoutDeletingTheirFiles() async throws {
+        let studio = try makeStudio(), source = try folder("Ignored Images")
+        let diffuse = source.appendingPathComponent("brick_diff.png"), depth = source.appendingPathComponent("brick_disp.png")
+        try image(diffuse); try image(depth)
+        try factoryTag(diffuse, role: "diffuse", category: "Bricks")
+        try factoryTag(depth, role: "depth", category: "Bricks", ignored: true)
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let ignoredTarget = try await project.snapshot(imageSize: 32)
+        XCTAssertEqual(ignoredTarget.imageCount, 1); XCTAssertEqual(ignoredTarget.datasets.first?.pairedCounts["depth"], 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: depth.path))
+        try factoryTag(diffuse, role: "diffuse", category: "Bricks", ignored: true)
+        let allIgnored = try await project.snapshot(imageSize: 32)
+        XCTAssertEqual(allIgnored.imageCount, 0); XCTAssertTrue(allIgnored.datasets.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: diffuse.path))
+    }
+
+    func testDiffuseNameAliasesMatchTargetsAndMaterialNameCannotOverrideBump() async throws {
+        let studio = try makeStudio()
+        for alias in ["diff", "color", "colour", "basecolor", "basecolour", "base_color", "base_colour", "base_col", "base_colo"] {
+            let source = try folder("Alias " + alias)
+            let diffuse = source.appendingPathComponent("brick_\(alias)_1k.png"), depth = source.appendingPathComponent("brick_disp_1k.png")
+            try image(diffuse); try image(depth)
+            let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+            let state = try await project.snapshot(imageSize: 32)
+            let samples = try currentSamples(source: source, studio: state.studio, imageSize: 32)
+            XCTAssertEqual(samples.count, 1, alias); XCTAssertEqual(samples.first?.targets["depth"], depth, alias)
+        }
+        let source = try folder("Role In Material Name")
+        let bump = source.appendingPathComponent("color_brick_bump_1k.png")
+        try image(bump)
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let state = try await project.snapshot(imageSize: 32)
+        XCTAssertEqual(state.imageCount, 0); XCTAssertEqual(imageTag(bump)?.role, "bump")
+    }
+
+    func testUnrecognizedFilenameNeverDefaultsToDiffuse() async throws {
+        let studio = try makeStudio(), source = try folder("Unrecognized Source")
+        let unknown = source.appendingPathComponent("mystery-image.png")
+        try image(unknown)
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let state = try await project.snapshot(imageSize: 32)
+        XCTAssertEqual(state.imageCount, 0)
+        XCTAssertEqual(imageTag(unknown)?.role, "unknown")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unknown.path))
+    }
+
+    func testProviderNormalGLPairsAndNormalDXNeverBecomesInputOrTarget() async throws {
+        let studio = try makeStudio(), source = try folder("Provider Normals")
+        let diffuse = source.appendingPathComponent("Bark_1K-PNG_Color.png")
+        let gl = source.appendingPathComponent("Bark_1K-PNG_NormalGL.png")
+        let dx = source.appendingPathComponent("Bark_1K-PNG_NormalDX.png")
+        for file in [diffuse, gl, dx] { try image(file) }
+        // Reproduce Workshop's earlier default-to-diffuse inference for NormalDX.
+        let oldPair = "pair-" + SHA256.hash(data: Data("/bark_1k_png_normaldx".utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        try writeTag(ImageTag(id: "old-dx", pairID: oldPair, role: "diffuse"), to: dx)
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let state = try await project.snapshot(imageSize: 32)
+        let samples = try currentSamples(source: source, studio: state.studio, imageSize: 32)
+        XCTAssertEqual(samples.count, 1); XCTAssertEqual(samples.first?.targets["normal"], gl)
+        XCTAssertEqual(imageTag(dx)?.id, "old-dx"); XCTAssertEqual(imageTag(dx)?.role, "normal")
+        XCTAssertEqual(imageTag(dx)?.normalConvention, "directx")
+        try FileManager.default.removeItem(at: gl)
+        let dxOnly = try currentSamples(source: source, studio: state.studio, imageSize: 32)
+        XCTAssertEqual(dxOnly.count, 1); XCTAssertNil(dxOnly.first?.targets["normal"])
+    }
+
+    func testMalformedFactoryMetadataCannotBypassIgnoredFileChecks() throws {
+        let studio = try makeStudio(), source = try folder("Unreadable Factory Metadata")
+        let file = source.appendingPathComponent("brick_diff.png")
+        try image(file)
+        let bytes = Data("{broken metadata".utf8)
+        XCTAssertEqual(bytes.withUnsafeBytes { setxattr(file.path, "com.gnaservicesinc.loomfactory.image.v1", $0.baseAddress, bytes.count, 0, 0) }, 0)
+        let base = try WorkshopProject.inspectStudio(at: studio)
+        XCTAssertThrowsError(try currentSamples(source: source, studio: base, imageSize: 32)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("metadata could not be read"))
+        }
+    }
+
     func testLinkedFolderMembershipFollowsCurrentLinksWithoutCycles() async throws {
         let studio = try makeStudio(), source = try folder("Source"), originals = try folder("Originals")
         let diffuse = originals.appendingPathComponent("brick_diff.png"), depth = originals.appendingPathComponent("brick_disp.png")
@@ -219,9 +351,9 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         let bitmap = NSBitmapImageRep(cgImage: image)
         try bitmap.representation(using: .png, properties: [:])!.write(to: url)
     }
-    private func factoryTag(_ url: URL, role: String, category: String?) throws {
+    private func factoryTag(_ url: URL, role: String, category: String?, ignored: Bool = false) throws {
         var tag: [String: Any] = ["id": UUID().uuidString, "pairingKey": "pair-preserved-through-renames", "role": role,
-            "verified": false, "note": "category chosen by user", "normalConvention": "opengl"]
+            "verified": false, "note": "category chosen by user", "normalConvention": "opengl", "ignored": ignored]
         if let category { tag["category"] = category }
         let data = try JSONSerialization.data(withJSONObject: tag)
         let status = data.withUnsafeBytes { setxattr(url.path, "com.gnaservicesinc.loomfactory.image.v1", $0.baseAddress, data.count, 0, 0) }
