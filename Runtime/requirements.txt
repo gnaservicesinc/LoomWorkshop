@@ -1,0 +1,9 @@
+torch==2.7.0
+coremltools==9.0
+safetensors==0.5.3
+numpy==1.26.4
+Pillow==11.2.1
+pypng==0.20220715.0
+tifffile==2025.6.11
+pillow-heif==1.8.1
+OpenEXR==3.5.2
