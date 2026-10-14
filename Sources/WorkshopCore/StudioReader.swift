@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import CoreML
+import LoomNative
 
 struct BaseManifest: Decodable, Sendable {
     struct File: Decodable, Sendable { let path: String; let sha256: String }
@@ -31,19 +32,28 @@ func modelPath(_ relative: String, in root: URL) throws -> URL {
     }
     return file
 }
-func fileSHA(_ file: URL) throws -> String {
+func fileSHA(_ file: URL, cancellation: NativeCancellation? = nil) throws -> String {
+    try cancellation?.check()
     let handle = try FileHandle(forReadingFrom: file); defer { try? handle.close() }
     var digest = SHA256()
-    while let bytes = try handle.read(upToCount: 1_048_576), !bytes.isEmpty { digest.update(data: bytes) }
+    while true {
+        try cancellation?.check()
+        guard let bytes = try handle.read(upToCount: 1_048_576), !bytes.isEmpty else { break }
+        digest.update(data: bytes)
+    }
+    try cancellation?.check()
     return digest.finalize().map { String(format: "%02x", $0) }.joined()
 }
-func verifyFiles(_ files: [BaseManifest.File], root: URL) throws {
+func verifyFiles(_ files: [BaseManifest.File], root: URL, cancellation: NativeCancellation? = nil) throws {
+    try cancellation?.check()
     guard !files.isEmpty, Set(files.map(\.path)).count == files.count else { throw WorkshopError("The model file inventory is empty or repeated.") }
     for entry in files {
-        guard try fileSHA(modelPath(entry.path, in: root)) == entry.sha256.lowercased() else { throw WorkshopError("A model file is missing or changed: \(entry.path).") }
+        try cancellation?.check()
+        guard try fileSHA(modelPath(entry.path, in: root), cancellation: cancellation) == entry.sha256.lowercased() else { throw WorkshopError("A model file is missing or changed: \(entry.path).") }
     }
 }
-func readStudio(_ application: URL) throws -> (StudioBase, BaseManifest) {
+func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) throws -> (StudioBase, BaseManifest) {
+    try cancellation?.check()
     let app = application.standardizedFileURL.resolvingSymlinksInPath()
     guard let info = try? PropertyListSerialization.propertyList(from: Data(contentsOf: app.appendingPathComponent("Contents/Info.plist")), format: nil) as? [String: Any],
           info["CFBundleIdentifier"] as? String == "org.ipde.texture-studio" else { throw WorkshopError("Choose the installed Texture Studio.app application.") }
@@ -58,16 +68,18 @@ func readStudio(_ application: URL) throws -> (StudioBase, BaseManifest) {
           Set(manifest.classifier.labels.map(\.classifierValue)).count == manifest.classifier.labels.count,
           Set(manifest.classifier.labels.map(\.id)) == Set(manifest.categories.map(\.id)),
           manifest.classifier.labels.allSatisfy({ label in !label.classifierValue.isEmpty && manifest.categories.contains { $0.id == label.id && $0.name == label.name } }) else { throw WorkshopError("Texture Studio's fixed model catalog is incomplete.") }
-    try verifyFiles(manifest.files, root: root)
+    try verifyFiles(manifest.files, root: root, cancellation: cancellation)
     let inventory = Set(manifest.files.map(\.path))
     let paths = [manifest.classifier.path] + (manifest.classifier.weightsPath.map { [$0] } ?? []) +
         manifest.categories.flatMap { $0.models.flatMap { [$0.path, $0.weightsPath] } }
     for path in paths {
+        try cancellation?.check()
         let file = try modelPath(path, in: root)
         guard FileManager.default.fileExists(atPath: file.path), inventory.contains(where: { $0 == path || $0.hasPrefix(path + "/") }) else { throw WorkshopError("The installed model is missing a registered native artifact: \(path).") }
         if (try file.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true {
             guard let entries = FileManager.default.enumerator(at: file, includingPropertiesForKeys: [.isRegularFileKey]) else { throw WorkshopError("The installed model folder could not be inspected.") }
             for case let item as URL in entries where try item.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true && item.lastPathComponent != ".DS_Store" {
+                try cancellation?.check()
                 let relative = String(item.standardizedFileURL.resolvingSymlinksInPath().path.dropFirst(root.standardizedFileURL.resolvingSymlinksInPath().path.count + 1))
                 _ = try modelPath(relative, in: root)
                 guard inventory.contains(relative) else { throw WorkshopError("The installed model has an unregistered artifact: \(relative).") }
@@ -75,8 +87,10 @@ func readStudio(_ application: URL) throws -> (StudioBase, BaseManifest) {
         }
     }
     if manifest.classifier.architecture == "create-ml-image-classifier-v1" {
+        try cancellation?.check()
         let source = try modelPath(manifest.classifier.path, in: root)
         let compiled = source.pathExtension == "mlmodelc" ? source : try MLModel.compileModel(at: source)
+        try cancellation?.check()
         let configuration = MLModelConfiguration(); configuration.computeUnits = .cpuOnly
         let description = try MLModel(contentsOf: compiled, configuration: configuration).modelDescription
         guard let input = manifest.classifier.inputName, let output = manifest.classifier.outputName,
@@ -107,8 +121,10 @@ func readStudio(_ application: URL) throws -> (StudioBase, BaseManifest) {
             }
         } else { throw WorkshopError("Texture Studio's classifier requires an image or RGB tensor input.") }
     }
-    let datasets = manifest.categories.map { category in
-        let profiles = category.models.compactMap { model -> BaseModelProfile? in
+    let datasets = try manifest.categories.map { category in
+        try cancellation?.check()
+        let profiles = try category.models.compactMap { model -> BaseModelProfile? in
+            try cancellation?.check()
             let parent = (model.weightsPath as NSString).deletingLastPathComponent
             let relative = parent.isEmpty ? "model.json" : parent + "/model.json"
             guard model.architecture == "loom-factory-material-residual-v1",
@@ -124,5 +140,6 @@ func readStudio(_ application: URL) throws -> (StudioBase, BaseManifest) {
         return BaseDataset(id: category.id, name: category.name, version: category.version,
             mapKinds: category.models.map(\.map), modelProfiles: profiles)
     }
+    try cancellation?.check()
     return (StudioBase(applicationURL: app, modelID: manifest.id, modelName: manifest.name, version: manifest.version, categories: datasets, packageURL: root), manifest)
 }

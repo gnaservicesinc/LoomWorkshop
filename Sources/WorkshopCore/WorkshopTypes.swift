@@ -45,7 +45,7 @@ public enum WorkshopDevice: String, Codable, Sendable, CaseIterable, Identifiabl
     case automatic = "auto", gpu = "mps", cpu
     public var id: String { rawValue }
     public var title: String {
-        switch self { case .automatic: "Automatic"; case .gpu: "Apple GPU"; case .cpu: "CPU" }
+        switch self { case .automatic: "Automatic (Apple GPU)"; case .gpu: "Apple GPU"; case .cpu: "CPU (unavailable)" }
     }
 }
 public struct StudioBase: Codable, Sendable {

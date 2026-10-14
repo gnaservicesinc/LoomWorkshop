@@ -286,7 +286,7 @@ struct WorkshopView: View {
                     GridRow {
                         Text("Training device").foregroundStyle(.secondary)
                         Picker("Training device", selection: $model.options.device) {
-                            ForEach(WorkshopDevice.allCases) { Text($0.title).tag($0) }
+                            ForEach(WorkshopDevice.allCases) { Text($0.title).tag($0).disabled($0 == .cpu) }
                         }.labelsHidden().frame(maxWidth: 180)
                     }
                     GridRow {
@@ -409,7 +409,7 @@ struct WorkshopView: View {
                 if model.busy {
                     Button("Stop") { model.cancel() }.disabled(model.sourceFolder == nil)
                 } else {
-                    Label("Local training", systemImage: "desktopcomputer")
+                    Label("Native Swift · Apple GPU", systemImage: "desktopcomputer")
                         .font(.callout).foregroundStyle(.secondary)
                     Button { model.train() } label: {
                         Label("Train LoRA", systemImage: "play.fill")

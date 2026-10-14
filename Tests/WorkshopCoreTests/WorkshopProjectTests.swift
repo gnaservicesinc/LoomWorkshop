@@ -78,6 +78,22 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         XCTAssertFalse(classifiedAgain.requiresClassification)
     }
 
+    func testFactoryCurrentSelectionCannotReuseStaleWorkshopCategory() async throws {
+        let studioURL = try makeStudio(includeWood: true), source = try folder("Selection Changes")
+        let diffuse = source.appendingPathComponent("brick_diff.png")
+        try image(diffuse); try factoryTag(diffuse, role: "diffuse", category: "Bricks")
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studioURL)
+        let original = try await project.snapshot(imageSize: 32)
+        XCTAssertEqual(try activeImageSelection(diffuse, studio: original.studio).categoryID, original.datasets.first?.id)
+        try factoryTag(diffuse, role: "diffuse", category: "Wood")
+        let wood = original.studio.categories.first { $0.name == "Wood" }!
+        XCTAssertEqual(try activeImageSelection(diffuse, studio: original.studio).categoryID, wood.id)
+        XCTAssertNotEqual(imageTag(diffuse)?.categoryID, wood.id)
+        try factoryTag(diffuse, role: "bump", category: nil, ignored: true)
+        let current = try activeImageSelection(diffuse, studio: original.studio)
+        XCTAssertNil(current.categoryID); XCTAssertEqual(current.role, "bump"); XCTAssertTrue(current.ignored)
+    }
+
     func testReviewFlagsAreOptionalAndNeverDetermineCurrentPairSelection() async throws {
         let studio = try makeStudio(), source = try folder("Optional Review Metadata")
         let diffuse = source.appendingPathComponent("brick_diff.png"), depth = source.appendingPathComponent("brick_disp.png")
@@ -314,11 +330,10 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testRuntimePlanTrainingAndExportAgainstRealBase() async throws {
+    func testNativePlanTrainingAndExportAgainstRealBase() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard let basePath = environment["LOOM_WORKSHOP_INTEGRATION_STUDIO"],
-              let sourcePath = environment["LOOM_WORKSHOP_INTEGRATION_SOURCE"],
-              let pythonPath = environment["LOOM_WORKSHOP_INTEGRATION_RUNTIME"] else { throw XCTSkip("Set the three LOOM_WORKSHOP_INTEGRATION paths to run the real Core ML and LoRA workflow.") }
+              let sourcePath = environment["LOOM_WORKSHOP_INTEGRATION_SOURCE"] else { throw XCTSkip("Set LOOM_WORKSHOP_INTEGRATION_STUDIO and LOOM_WORKSHOP_INTEGRATION_SOURCE to run the real native Core ML and LoRA workflow.") }
         let installed = try folder("Texture Studio.app")
         try FileManager.default.createDirectory(at: installed.appendingPathComponent("Contents"), withIntermediateDirectories: true)
         let sourceBase = URL(fileURLWithPath: basePath).appendingPathComponent("Contents/Resources/TextureLoom", isDirectory: true)
@@ -335,7 +350,6 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         let project = try WorkshopProject(sourceFolder: images, textureStudio: installed)
         let initial = try await project.snapshot(imageSize: 64)
         XCTAssertGreaterThan(initial.imageCount, 0); XCTAssertTrue(initial.requiresClassification)
-        try FileManager.default.createSymbolicLink(at: images.appendingPathComponent(".loom-workshop/runtime", isDirectory: true), withDestinationURL: URL(fileURLWithPath: pythonPath, isDirectory: true))
         var options = WorkshopOptions(); options.imageSize = 64; options.epochs = 1; options.rank = 2; options.flipCrops = false; options.shuffleEachEpoch = false
         try await project.updateOptions(options)
         let planned = try await project.plan(progress: { _ in })

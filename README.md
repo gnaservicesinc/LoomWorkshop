@@ -10,13 +10,13 @@ Review flags and notes are informational. Training uses current files, dataset t
 
 Texture Studio is checked in `/Applications` first. Choose its application bundle if it is installed elsewhere. That build must contain a complete Texture Loom package produced by Loom Factory; Workshop does not substitute another base model.
 
-Training settings, its Python environment, logs, and adapters stay under `.loom-workshop` in the chosen image folder. Image metadata preserves pair identity across renames. Changing the folder clears the active project; reopening a folder restores its settings. Original image pixels and the installed base weights are preserved.
+Training settings, logs, checkpoints, and adapters stay under `.loom-workshop` in the chosen image folder. Image metadata preserves pair identity across renames. Changing the folder clears the active project; reopening a folder restores its settings. Original image pixels and the installed base weights are preserved.
 
 The image-order checkbox selects a fixed order or a new order each epoch. Crop positions and flips/quarter-turn rotations have separate timing controls: every presentation, once per epoch, or once per run. Positions remain random where the source has room. Normal vectors transform with the paired image. **Exaggerate features** strengthens depth relief during training.
 
-Advanced options expose AdamW, Adam, SGD with momentum, and Lion; learning rate and constant/cosine scheduling with epoch warmup; batch size, gradient accumulation, clipping, decay and optimizer coefficients; LoRA rank and alpha; random seed and CPU/Apple GPU selection. The summary derives frozen-base and trainable-LoRA parameter counts from each installed model descriptor. Accumulated gradients are weighted by the actual number of pairs, including the final partial update. Lion generally needs a lower learning rate than AdamW.
+Advanced options expose AdamW, Adam, SGD with momentum, and Lion; learning rate and constant/cosine scheduling with epoch warmup; batch size, gradient accumulation, clipping, decay and optimizer coefficients; LoRA rank and alpha; random seed and Apple GPU selection. The summary derives frozen-base and trainable-LoRA parameter counts from each installed model descriptor. Accumulated gradients are weighted by the actual number of pairs, including the final partial update. Lion generally needs a lower learning rate than AdamW.
 
-Checkpoint cadence saves LoRA deltas, optimizer state and sampling state under the run's `checkpoints` folder at epoch boundaries. Checkpoint files preserve intermediate work; a completed, validated adapter is still required for installation. Workshop does not currently expose checkpoint continuation or held-out early stopping.
+Checkpoint cadence saves LoRA deltas, native safetensor optimizer state and deterministic sampling state under the run's `checkpoints` folder at epoch boundaries. Stop also saves the last completed finite update, marked as an incomplete epoch. Checkpoint files preserve intermediate work; a completed, validated adapter is still required for installation. Workshop does not currently expose checkpoint continuation or held-out early stopping. Native sampling retains crop and augmentation refresh timing and is deterministic, with a new random sequence from the retired runtime.
 
 Build with Swift 6.2 on macOS 26 or later:
 
@@ -26,6 +26,15 @@ Scripts/build-app.sh
 Scripts/install-app.sh
 ```
 
-`build-app.sh` produces a signed local bundle under `.build/application`. The installer retains any previous app as a backup and refuses to replace a running app. Runtime setup is automatic and stored in the image folder. Exported adapters are tied to the exact installed base identity, version, and weight checksums.
+`build-app.sh` produces a signed local bundle under `.build/application`. The installer retains any previous app as a backup and refuses to replace a running app. The app trains natively with Swift and MPSGraph on the Apple GPU; it does not create or launch a Python environment. Exported adapters are tied to the exact installed base identity, version, and weight checksums.
+
+SwiftPM fetches the native training library from a pinned Loom Factory revision,
+so Workshop builds from its own checkout. When developing both repositories,
+set `LOOM_NATIVE_DEVELOPMENT_PATH` to the local Loom Factory checkout to use its
+current sources explicitly.
 
 Native SwiftUI layout tests render the startup and populated workflow at the supported window sizes. These are view renderings; they do not certify trained texture quality. Assess a trained model on new materials before deploying it.
+
+The native LoRA graph freezes every installed convolution and bias. Only low-rank down/up tensors receive gradients. Exports include those adapter safetensors plus a fused Core ML model, checked against native inference before publishing the adapter manifest. Stop cancels a shared native token from the responsive project actor and returns after the current bounded GPU operation. CPU training settings saved by older versions are retained, but require selecting Apple GPU because this backend has no CPU trainer.
+
+For sibling-checkout development, set `LOOM_NATIVE_DEVELOPMENT_PATH` to the Loom Factory checkout that provides the `LoomNative` library.

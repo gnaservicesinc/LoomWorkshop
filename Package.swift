@@ -1,5 +1,14 @@
 // swift-tools-version: 6.2
 import PackageDescription
+import Foundation
+
+let nativeDependency: Package.Dependency
+if let path = ProcessInfo.processInfo.environment["LOOM_NATIVE_DEVELOPMENT_PATH"] {
+    nativeDependency = .package(path: path)
+} else {
+    nativeDependency = .package(url: "https://github.com/gnaservicesinc/LoomFactory.git",
+        revision: "206cc4dd180cf25fd4ed8731ef1a447dc44bd492")
+}
 
 let package = Package(
     name: "LoomWorkshop",
@@ -8,8 +17,9 @@ let package = Package(
         .library(name: "WorkshopCore", targets: ["WorkshopCore"]),
         .executable(name: "LoomWorkshop", targets: ["LoomWorkshop"])
     ],
+    dependencies: [nativeDependency],
     targets: [
-        .target(name: "WorkshopCore"),
+        .target(name: "WorkshopCore", dependencies: [.product(name: "LoomNative", package: "LoomFactory")]),
         .executableTarget(name: "LoomWorkshop", dependencies: ["WorkshopCore"]),
         .testTarget(name: "WorkshopCoreTests", dependencies: ["WorkshopCore"], path: "Tests/WorkshopCoreTests"),
         .testTarget(name: "LoomWorkshopUITests", dependencies: ["WorkshopCore", "LoomWorkshop"], path: "Tests/LoomWorkshopUITests")

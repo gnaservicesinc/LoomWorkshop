@@ -17,10 +17,19 @@ struct ImageTag: Codable, Sendable {
 }
 struct WorkshopSample: Sendable {
     let id: String
+    let pairID: String
     let input: URL
     let targets: [String: URL]
     let categoryID: String?
     let normalConvention: String
+}
+struct ActiveImageSelection {
+    let id: String
+    let pairID: String
+    let role: String
+    let categoryID: String?
+    let normalConvention: String
+    let ignored: Bool
 }
 private struct FactoryTag: Decodable {
     let id: String
@@ -31,6 +40,23 @@ private struct FactoryTag: Decodable {
     let ignored: Bool?
 }
 private let tagKey = "org.gnaservicesinc.loom-workshop.image.v1"
+func activeImageSelection(_ file: URL, studio: StudioBase) throws -> ActiveImageSelection {
+    guard let tag = imageTag(file) else { throw WorkshopError("The image lost its identity metadata: \(file.lastPathComponent).") }
+    let state = try identity(file)
+    var category = tag.baseID == studio.modelID && tag.baseVersion == studio.version &&
+        tag.classifiedBytes == state.0 && tag.classifiedModified == state.1 ? tag.categoryID : nil
+    if let data = metadataBytes(file, key: "com.gnaservicesinc.loomfactory.image.v1") {
+        let factory = try JSONDecoder().decode(FactoryTag.self, from: data)
+        let name = factory.category?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let name, !name.isEmpty { category = "dataset-" + digest(name.lowercased()) }
+        else if tag.factoryCategory != nil { category = nil }
+        return ActiveImageSelection(id: tag.id, pairID: factory.pairingKey, role: factory.role, categoryID: category,
+            normalConvention: factory.normalConvention ?? tag.normalConvention ?? "opengl", ignored: factory.ignored == true)
+    }
+    if tag.factoryCategory != nil { category = nil }
+    return ActiveImageSelection(id: tag.id, pairID: tag.pairID, role: tag.role, categoryID: category,
+        normalConvention: tag.normalConvention ?? "opengl", ignored: false)
+}
 private func metadataBytes(_ file: URL, key: String) -> Data? {
     let size = getxattr(file.path, key, nil, 0, 0, 0)
     guard size > 0, size <= 65536 else { return nil }
@@ -45,6 +71,22 @@ func writeTag(_ tag: ImageTag, to file: URL) throws {
     let data = try JSONEncoder().encode(tag)
     let result = data.withUnsafeBytes { setxattr(file.path, tagKey, $0.baseAddress, data.count, 0, 0) }
     guard result == 0 else { throw WorkshopError("Image metadata could not be saved for \(file.lastPathComponent). Check that the source folder is writable.") }
+}
+/// Review flags and notes remain informational; only these fields select training data.
+func membershipSignature(_ file: URL) throws -> Data {
+    let specifications: [(String, [String])] = [
+        ("com.gnaservicesinc.loomfactory.image.v1", ["id", "pairingKey", "role", "category", "normalConvention", "ignored"]),
+        (tagKey, ["id", "pairID", "role", "categoryID", "baseID", "baseVersion", "classifiedBytes", "classifiedModified", "factoryCategory", "normalConvention"])
+    ]
+    var result: [Any] = []
+    for (key, fields) in specifications {
+        guard let data = metadataBytes(file, key: key) else { result.append(NSNull()); continue }
+        guard let tag = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw WorkshopError("Image metadata needs repair: \(file.lastPathComponent).")
+        }
+        result.append(Dictionary(uniqueKeysWithValues: fields.map { ($0, tag[$0] ?? NSNull()) }))
+    }
+    return try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
 }
 func imageDimensions(_ file: URL) -> (Int, Int)? {
     guard let source = CGImageSourceCreateWithURL(file as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
@@ -209,7 +251,7 @@ func currentSamples(source: URL, studio: StudioBase, imageSize: Int) throws -> [
                 }
             }
         }
-        samples.append(WorkshopSample(id: tag.id, input: input, targets: targets,
+        samples.append(WorkshopSample(id: tag.id, pairID: tag.pairID, input: input, targets: targets,
                                       categoryID: tag.categoryID, normalConvention: convention))
     }
     return samples.sorted { $0.input.path < $1.input.path }

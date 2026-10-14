@@ -39,6 +39,7 @@ final class WorkshopModel {
         selectedDatasetID.isEmpty ? availableDatasets.map(\.id) : [selectedDatasetID]
     }
     var trainingOptionsIssue: String? {
+        if options.device == .cpu { return "Native training uses the Apple GPU. Choose Automatic or Apple GPU to start." }
         do { try options.validate(); return nil }
         catch { return error.localizedDescription }
     }
@@ -139,7 +140,9 @@ final class WorkshopModel {
         operation = Task {
             if let oldProject { await oldProject.cancel() }
             do {
-                let opened = try WorkshopProject(sourceFolder: url, textureStudio: studio.applicationURL)
+                let opened = try await Task.detached(priority: .userInitiated) {
+                    try WorkshopProject(sourceFolder: url, textureStudio: studio.applicationURL)
+                }.value
                 let value = try await opened.snapshot()
                 let adapter = try await opened.latestAdapter()
                 guard current == generation, !Task.isCancelled else { return }
@@ -319,6 +322,7 @@ final class WorkshopModel {
                 guard let self, self.generation == current else { return }
                 self.events.append(event)
                 if self.events.count > 200 { self.events.removeFirst(self.events.count - 200) }
+                guard self.operation?.isCancelled != true else { return }
                 self.status = event.message
                 if let progress = event.progress { self.progress = progress }
             }

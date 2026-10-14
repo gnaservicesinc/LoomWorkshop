@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import LoomNative
 
 private struct WorkshopDocument: Codable, Sendable {
     var schema = "loom-workshop.project.v1"
@@ -21,6 +22,7 @@ public actor WorkshopProject {
     public nonisolated let textureStudio: URL
     private var document: WorkshopDocument
     private var activeProcess: Process?
+    private var nativeCancellation: NativeCancellation?
     private var operationActive = false
 
     public nonisolated static func inspectStudio(at application: URL) throws -> StudioBase { try readStudio(application).0 }
@@ -83,15 +85,33 @@ public actor WorkshopProject {
 
     public func plan(progress: @escaping @Sendable (WorkshopEvent) -> Void) async throws -> WorkshopPlan {
         try beginOperation(); defer { operationActive = false }
-        _ = try await run(command: "plan", options: document.options, progress: progress)
+        let cancellation = NativeCancellation()
+        nativeCancellation = cancellation
+        defer { nativeCancellation = nil }
+        let engine = NativeWorkshopEngine(source: sourceFolder, project: projectFolder, application: textureStudio,
+            options: document.options, cancellation: cancellation, progress: progress)
+        try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) { try engine.plan() }.value
+            try Task.checkCancellation()
+        } onCancel: { cancellation.cancel() }
         return try snapshot()
     }
 
     public func train(options: WorkshopOptions, progress: @escaping @Sendable (WorkshopEvent) -> Void) async throws -> URL {
         try beginOperation(); defer { operationActive = false }
         try updateOptions(options)
-        let run = try await run(command: "train", options: options, progress: progress)
-        let adapter = run.appendingPathComponent("adapter", isDirectory: true)
+        let cancellation = NativeCancellation()
+        nativeCancellation = cancellation
+        defer { nativeCancellation = nil }
+        let run = projectFolder.appendingPathComponent("runs/" + UUID().uuidString.lowercased(), isDirectory: true)
+        try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
+        let engine = NativeWorkshopEngine(source: sourceFolder, project: projectFolder, application: textureStudio,
+            options: options, cancellation: cancellation, progress: progress)
+        let adapter = try await withTaskCancellationHandler {
+            let result = try await Task.detached(priority: .userInitiated) { try engine.train(run: run) }.value
+            try Task.checkCancellation()
+            return result
+        } onCancel: { cancellation.cancel() }
         _ = try validateAdapter(adapter)
         progress(WorkshopEvent(message: "Your LoRA is ready for Texture Studio", progress: 1))
         return adapter
@@ -128,7 +148,10 @@ public actor WorkshopProject {
         throw WorkshopError("The LoRA was sent to Texture Studio, but installation has not completed. Check Texture Studio's LoRA manager, then try again.")
     }
 
-    public func cancel() { if let activeProcess, activeProcess.isRunning { activeProcess.terminate() } }
+    public func cancel() {
+        nativeCancellation?.cancel()
+        if let activeProcess, activeProcess.isRunning { activeProcess.terminate() }
+    }
 
     private func beginOperation() throws {
         guard !operationActive else { throw WorkshopError("An operation is already running in this source folder. Stop it before starting another.") }
@@ -141,64 +164,11 @@ public actor WorkshopProject {
     private func validate(_ options: WorkshopOptions) throws {
         try options.validate()
     }
-    private func run(command: String, options: WorkshopOptions, progress: @escaping @Sendable (WorkshopEvent) -> Void) async throws -> URL {
-        try validate(options)
-        let studio = try readStudio(textureStudio).0
-        let samples = try currentSamples(source: sourceFolder, studio: studio, imageSize: options.imageSize)
-        guard !samples.isEmpty else { throw WorkshopError("This folder has no diffuse images. Add diffuse images with matching material maps.") }
-        guard Set(options.datasetIDs).isSubset(of: Set(studio.categories.map(\.id))) else { throw WorkshopError("A selected dataset is absent from this Texture Studio build.") }
-        let run = projectFolder.appendingPathComponent("runs/" + UUID().uuidString.lowercased(), isDirectory: true)
-        try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
-        let input: [[String: Any]] = samples.map { sample in
-            var value: [String: Any] = ["id": sample.id, "input": sample.input.path, "targets": sample.targets.mapValues(\.path), "normal_convention": sample.normalConvention]
-            if let category = sample.categoryID { value["category_id"] = category }
-            return value
-        }
-        let request: [String: Any] = ["schema": "loom-workshop-training-v1", "source_root": sourceFolder.path,
-            "output_directory": run.path, "texture_studio_path": textureStudio.path, "base_root": studio.packageURL.path,
-            "base_id": studio.modelID, "base_version": studio.version, "adapter_name": options.name,
-            "selected_category_ids": options.datasetIDs, "samples": input, "image_size": options.imageSize,
-            "epochs": options.epochs, "batch_size": options.batchSize, "learning_rate": options.learningRate,
-            "gradient_accumulation_steps": options.gradientAccumulationSteps, "optimizer": options.optimizer.rawValue,
-            "weight_decay": options.weightDecay, "beta1": options.beta1, "beta2": options.beta2,
-            "momentum": options.momentum, "gradient_clip_norm": options.maxGradientNorm,
-            "lr_schedule": options.learningRateSchedule.rawValue, "warmup_epochs": options.warmupEpochs,
-            "minimum_lr_ratio": options.minimumLearningRateRatio,
-            "crop_refresh": options.cropRefresh.rawValue, "augmentation_refresh": options.augmentationRefresh.rawValue,
-            "rank": options.rank, "alpha": options.alpha, "shuffle_each_epoch": options.shuffleEachEpoch,
-            "flip_crops": options.flipCrops, "rotate_crops": options.rotateCrops, "exaggerate_features": options.exaggerateFeatures,
-            "seed": options.seed, "device": options.device.rawValue, "checkpoint_every_epochs": options.checkpointEveryEpochs]
-        let requestFile = run.appendingPathComponent("request.json")
-        try JSONSerialization.data(withJSONObject: request, options: [.prettyPrinted, .sortedKeys]).write(to: requestFile, options: .atomic)
-        let runtime = try runtimeCode()
-        let python = projectFolder.appendingPathComponent("runtime/bin/python")
-        if !FileManager.default.isExecutableFile(atPath: python.path) {
-            progress(.init(message: "Preparing the training runtime in this source folder"))
-            try await execute(URL(fileURLWithPath: "/bin/bash"), arguments: [runtime.appendingPathComponent("setup_runtime.sh").path, sourceFolder.path],
-                              variables: [:], log: run.appendingPathComponent("setup.log"), progress: progress)
-        }
-        try Task.checkCancellation()
-        try await execute(python, arguments: ["-m", "loom_workshop", command, "--request", requestFile.path],
-                          variables: ["PYTHONPATH": runtime.path], log: run.appendingPathComponent(command + ".log"), progress: progress)
-        return run
-    }
-
-    private func runtimeCode() throws -> URL {
-        let candidates = [ProcessInfo.processInfo.environment["LOOM_WORKSHOP_RUNTIME"].map { URL(fileURLWithPath: $0, isDirectory: true) },
-            Bundle.main.resourceURL?.appendingPathComponent("Runtime", isDirectory: true),
-            URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Runtime", isDirectory: true)].compactMap { $0 }
-        guard let runtime = candidates.first(where: { FileManager.default.fileExists(atPath: $0.appendingPathComponent("loom_workshop/__main__.py").path) }) else {
-            throw WorkshopError("Loom Workshop's training runtime is missing. Reinstall Loom Workshop.")
-        }
-        return runtime
-    }
-
     private func execute(_ executable: URL, arguments: [String], variables: [String: String], log: URL,
                          progress: @escaping @Sendable (WorkshopEvent) -> Void) async throws {
         let child = Process()
         child.executableURL = executable; child.arguments = arguments; child.currentDirectoryURL = sourceFolder
         child.environment = ProcessInfo.processInfo.environment.merging(variables) { _, replacement in replacement }
-        child.environment?["PYTHONUNBUFFERED"] = "1"; child.environment?["PYTHONDONTWRITEBYTECODE"] = "1"
         let output = Pipe(); child.standardOutput = output; child.standardError = output
         guard FileManager.default.createFile(atPath: log.path, contents: nil) else { throw WorkshopError("The project run log could not be created.") }
         let logger = try FileHandle(forWritingTo: log)

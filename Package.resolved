@@ -1,0 +1,14 @@
+{
+  "originHash" : "382caf1fb19346c26d27564286c094fca8e878b7d07d18b80def813114285db1",
+  "pins" : [
+    {
+      "identity" : "loomfactory",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/gnaservicesinc/LoomFactory.git",
+      "state" : {
+        "revision" : "206cc4dd180cf25fd4ed8731ef1a447dc44bd492"
+      }
+    }
+  ],
+  "version" : 3
+}
