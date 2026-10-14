@@ -71,19 +71,20 @@ struct NativeWorkshopEngine: Sendable {
                 try cancellation.check()
                 let members = groups[key]!
                 let first = members[0], category = first.category, artifact = first.artifact
-                guard artifact.architecture == "loom-factory-material-residual-v1" else {
+                guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier].contains(artifact.architecture) else {
                     throw WorkshopError("This custom base architecture needs a compatible Loom Workshop version.")
                 }
                 let baseWeightsURL = try modelPath(artifact.weightsPath, in: studio.packageURL)
                 let baseHash = try fileSHA(baseWeightsURL, cancellation: cancellation)
                 let descriptorURL = baseWeightsURL.deletingLastPathComponent().appendingPathComponent("model.json")
                 guard let descriptor = try JSONSerialization.jsonObject(with: Data(contentsOf: descriptorURL)) as? [String: Any],
+                      (descriptor["architecture"] as? String).map({ $0 == artifact.architecture }) ?? true,
                       let config = (descriptor["architecture_config"] ?? descriptor["architecture"]) as? [String: Any],
-                      config["id"] as? String == "loom-factory-material-residual-v1",
+                      config["id"] as? String == artifact.architecture,
                       let width = config["width"] as? Int, let blocks = config["blocks"] as? Int else {
                     throw WorkshopError("The installed base is missing its LoRA architecture configuration.")
                 }
-                let architecture = try NativeArchitecture(mapKind: artifact.map, width: width, blocks: blocks)
+                let architecture = try NativeArchitecture(mapKind: artifact.map, width: width, blocks: blocks, identifier: artifact.architecture)
                 let frozen = try NativeWeights.read(from: baseWeightsURL)
                 let nativeOptions = try NativeTrainingOptions(optimizer: options.optimizer.rawValue, weightDecay: options.weightDecay,
                     beta1: options.optimizer == .sgd ? 0.9 : options.beta1,
@@ -91,7 +92,7 @@ struct NativeWorkshopEngine: Sendable {
                     momentum: options.optimizer == .sgd ? options.momentum : 0.9, gradientClipNorm: options.maxGradientNorm)
                 let session = try NativeTrainingSession(architecture: architecture, options: nativeOptions, seed: UInt64(options.seed),
                     weights: frozen, adapter: NativeAdapterConfiguration(rank: options.rank, alpha: options.alpha),
-                    device: options.device.rawValue, cancellation: cancellation)
+                    device: options.device.rawValue, cancellation: cancellation, channelsLast: !architecture.isPyramid)
                 let stepsPerEpoch = Self.stepsPerEpoch(samples: members.count, options: options)
                 let groupTotal = stepsPerEpoch * options.epochs
                 let baseParameters = frozen.values.reduce(0) { $0 + $1.values.count }

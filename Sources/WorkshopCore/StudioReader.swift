@@ -127,15 +127,17 @@ func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) thr
             try cancellation?.check()
             let parent = (model.weightsPath as NSString).deletingLastPathComponent
             let relative = parent.isEmpty ? "model.json" : parent + "/model.json"
-            guard model.architecture == "loom-factory-material-residual-v1",
+            guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier].contains(model.architecture),
                   let path = try? modelPath(relative, in: root), inventory.contains(relative),
                   let data = try? Data(contentsOf: path),
                   let descriptor = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (descriptor["architecture"] as? String).map({ $0 == model.architecture }) ?? true,
                   let config = (descriptor["architecture_config"] ?? descriptor["architecture"]) as? [String: Any],
-                  config["id"] as? String == "loom-factory-material-residual-v1",
+                  config["id"] as? String == model.architecture,
                   let width = config["width"] as? Int, let blocks = config["blocks"] as? Int,
-                  (4...512).contains(width), (1...64).contains(blocks) else { return nil }
-            return BaseModelProfile(map: model.map, width: width, blocks: blocks)
+                  (4...512).contains(width), (1...64).contains(blocks),
+                  (try? NativeArchitecture(mapKind: model.map, width: width, blocks: blocks, identifier: model.architecture)) != nil else { return nil }
+            return BaseModelProfile(map: model.map, width: width, blocks: blocks, architecture: model.architecture)
         }
         return BaseDataset(id: category.id, name: category.name, version: category.version,
             mapKinds: category.models.map(\.map), modelProfiles: profiles)

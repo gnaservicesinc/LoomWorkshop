@@ -1,4 +1,5 @@
 import Foundation
+import LoomNative
 
 public struct BaseDataset: Codable, Sendable, Identifiable {
     public let id: String
@@ -11,15 +12,21 @@ public struct BaseModelProfile: Codable, Sendable, Identifiable {
     public let map: String
     public let width: Int
     public let blocks: Int
+    public var architecture: String? = nil
     public var id: String { map }
     public var baseParameters: Int {
         guard (4...512).contains(width), (1...64).contains(blocks) else { return 0 }
-        let outputs = map == "normal" ? 3 : 1
-        return 28 * width + blocks * (18 * width * width + 2 * width) + 9 * width * outputs + outputs
+        return (try? NativeArchitecture(mapKind: map, width: width, blocks: blocks,
+            identifier: architecture ?? NativeArchitecture.identifier).parameterCount) ?? 0
     }
     public func trainableParameters(rank: Int) -> Int {
         guard (1...128).contains(rank), (4...512).contains(width), (1...64).contains(blocks) else { return 0 }
-        return rank * (27 + width + blocks * 20 * width + 9 * width + (map == "normal" ? 3 : 1))
+        guard let network = try? NativeArchitecture(mapKind: map, width: width, blocks: blocks,
+            identifier: architecture ?? NativeArchitecture.identifier) else { return 0 }
+        return network.convolutionNames.reduce(0) { count, name in
+            let shape = network.parameterShapes[name + ".weight"]!
+            return count + rank * (shape[1] * shape[2] * shape[3] + shape[0])
+        }
     }
 }
 public enum WorkshopOptimizer: String, Codable, Sendable, CaseIterable, Identifiable {

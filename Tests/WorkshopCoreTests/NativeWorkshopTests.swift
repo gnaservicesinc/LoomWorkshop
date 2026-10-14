@@ -9,10 +9,22 @@ import XCTest
 
 final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
     func testNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA() async throws {
-        let fixture = try NativeWorkshopFixture()
+        try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.identifier)
+    }
+
+    func testPyramidPlanOneUpdatePreservesBaseAndExportsCompatibleLoRA() async throws {
+        try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.pyramidIdentifier)
+    }
+
+    private func checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: String) async throws {
+        let fixture = try NativeWorkshopFixture(architectureID: architectureID)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let original = try Data(contentsOf: fixture.baseWeights)
         let project = try WorkshopProject(sourceFolder: fixture.images, textureStudio: fixture.application)
+        let (base, _) = try readStudio(fixture.application)
+        let profile = try XCTUnwrap(base.categories.first?.modelProfiles?.first)
+        XCTAssertEqual(profile.architecture, architectureID)
+        XCTAssertEqual(profile.baseParameters, try NativeWeights.read(from: fixture.baseWeights).values.reduce(0) { $0 + $1.values.count })
         var options = WorkshopOptions(); options.imageSize = 32; options.epochs = 1; options.rank = 2; options.alpha = 2
         options.flipCrops = false; options.shuffleEachEpoch = false; options.learningRate = 0.001
         try await project.updateOptions(options)
@@ -24,6 +36,7 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         let category = (manifest["categories"] as! [[String: Any]])[0]
         let model = (category["adapters"] as! [[String: Any]])[0]
         let weights = try NativeWeights.read(from: adapter.appendingPathComponent(model["weightsPath"] as! String))
+        XCTAssertEqual(profile.trainableParameters(rank: options.rank), weights.values.reduce(0) { $0 + $1.values.count })
         XCTAssertTrue(weights.keys.allSatisfy { $0.hasSuffix(".down.weight") || $0.hasSuffix(".up.weight") })
         XCTAssertTrue(weights.filter { $0.key.hasSuffix(".up.weight") }.values.contains { $0.values.contains { $0 != 0 } })
         let metadataURL = adapter.appendingPathComponent(model["weightsPath"] as! String).deletingLastPathComponent().appendingPathComponent("adapter.json")
@@ -115,7 +128,7 @@ private struct NativeWorkshopFixture {
     let target: URL
     let originalDiffuse: Data
     let originalTarget: Data
-    init() throws {
+    init(architectureID: String = NativeArchitecture.identifier) throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("native-workshop-" + UUID().uuidString, isDirectory: true).resolvingSymlinksInPath()
         application = root.appendingPathComponent("Texture Studio.app", isDirectory: true)
         images = root.appendingPathComponent("Images", isDirectory: true)
@@ -124,7 +137,7 @@ private struct NativeWorkshopFixture {
         try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
         try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "org.ipde.texture-studio"], format: .xml, options: 0)
             .write(to: application.appendingPathComponent("Contents/Info.plist"))
-        let architecture = try NativeArchitecture(mapKind: "depth", width: 4, blocks: 1)
+        let architecture = try NativeArchitecture(mapKind: "depth", width: 4, blocks: 1, identifier: architectureID)
         let initial = try NativeTrainingSession(architecture: architecture, options: NativeTrainingOptions(), seed: 42)
         baseWeights = models.appendingPathComponent("weights.safetensors")
         try NativeWeights.write(initial.weights(), to: baseWeights)
@@ -137,7 +150,7 @@ private struct NativeWorkshopFixture {
         try NativeWorkshopEngine.json(["schema": "texture-loom.package.v1", "id": UUID().uuidString,
             "name": "Native LoRA fixture", "version": "1.0.0",
             "classifier": ["path": "classifier.native", "labels": [["id": category, "name": "Bricks"]]],
-            "categories": [["id": category, "name": "Bricks", "version": "1.0.0", "models": [["map": "depth", "architecture": NativeArchitecture.identifier,
+            "categories": [["id": category, "name": "Bricks", "version": "1.0.0", "models": [["map": "depth", "architecture": architecture.identifier,
                 "path": "map.mlmodel", "weightsPath": "weights.safetensors"]]]],
             "files": try paths.map { ["path": $0, "sha256": try fileSHA(models.appendingPathComponent($0))] }],
             to: models.appendingPathComponent("manifest.json"))
