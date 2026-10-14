@@ -381,6 +381,23 @@ struct WorkshopView: View {
             if model.installed {
                 Button("Open Texture Studio") { model.openStudio() }
             }
+            if !model.savedRuns.isEmpty {
+                Divider()
+                Text("Saved training runs").font(.headline)
+                Picker("Saved run", selection: $model.selectedSavedRunID) {
+                    ForEach(model.savedRuns) { run in
+                        Text("\(run.name) · \(run.updates.formatted()) updates").tag(run.id)
+                    }
+                }.labelsHidden().disabled(model.busy)
+                Button("Resume Saved Run") { model.resumeSavedRun() }
+                    .disabled(model.busy).accessibilityIdentifier("resume-saved-run")
+                Text("Continues the saved optimizer, crop order and exact update using that run's settings.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if model.latestCheckpoint != nil || !model.savedRuns.isEmpty {
+                Button("Show Saved Checkpoint") { model.revealLatestCheckpoint() }
+            }
+            Button("Open Runs Folder") { model.revealRuns() }.disabled(model.sourceFolder == nil)
         }.sidebarCard()
     }
 
@@ -406,7 +423,19 @@ struct WorkshopView: View {
                     }
                 }
                 Spacer()
-                if model.busy {
+                if model.trainingActive {
+                    Button("Save Checkpoint") { model.saveCheckpoint() }
+                        .disabled(model.checkpointPending || model.stoppingAfterSave)
+                        .accessibilityIdentifier("save-training-checkpoint")
+                    Button("Save & Stop") { model.saveAndStop() }
+                        .disabled(model.stoppingAfterSave)
+                        .accessibilityIdentifier("save-and-stop-training")
+                    Menu {
+                        Button("Stop Current Operation") { model.cancel() }
+                    } label: { Image(systemName: "ellipsis") }
+                        .menuStyle(.borderlessButton).fixedSize()
+                        .disabled(model.stoppingAfterSave)
+                } else if model.busy {
                     Button("Stop") { model.cancel() }.disabled(model.sourceFolder == nil)
                 } else {
                     Label("Native Swift · Apple GPU", systemImage: "desktopcomputer")

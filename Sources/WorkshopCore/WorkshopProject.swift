@@ -23,6 +23,7 @@ public actor WorkshopProject {
     private var document: WorkshopDocument
     private var activeProcess: Process?
     private var nativeCancellation: NativeCancellation?
+    private var trainingControl: WorkshopTrainingControl?
     private var operationActive = false
 
     public nonisolated static func inspectStudio(at application: URL) throws -> StudioBase { try readStudio(application).0 }
@@ -97,24 +98,67 @@ public actor WorkshopProject {
         return try snapshot()
     }
 
-    public func train(options: WorkshopOptions, progress: @escaping @Sendable (WorkshopEvent) -> Void) async throws -> URL {
+    public func train(options: WorkshopOptions, resumeRun: URL? = nil, progress: @escaping @Sendable (WorkshopEvent) -> Void) async throws -> URL {
         try beginOperation(); defer { operationActive = false }
+        if let resumeRun { _ = try savedRun(at: resumeRun) }
         try updateOptions(options)
         let cancellation = NativeCancellation()
+        let control = WorkshopTrainingControl()
         nativeCancellation = cancellation
-        defer { nativeCancellation = nil }
-        let run = projectFolder.appendingPathComponent("runs/" + UUID().uuidString.lowercased(), isDirectory: true)
+        trainingControl = control
+        defer { control.finish(); nativeCancellation = nil; trainingControl = nil }
+        let run = resumeRun ?? projectFolder.appendingPathComponent("runs/" + UUID().uuidString.lowercased(), isDirectory: true)
         try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
         let engine = NativeWorkshopEngine(source: sourceFolder, project: projectFolder, application: textureStudio,
-            options: options, cancellation: cancellation, progress: progress)
+            options: options, cancellation: cancellation, progress: progress, control: control, resuming: resumeRun != nil)
         let adapter = try await withTaskCancellationHandler {
             let result = try await Task.detached(priority: .userInitiated) { try engine.train(run: run) }.value
-            try Task.checkCancellation()
             return result
         } onCancel: { cancellation.cancel() }
         _ = try validateAdapter(adapter)
         progress(WorkshopEvent(message: "Your LoRA is ready for Texture Studio", progress: 1))
         return adapter
+    }
+
+    public func saveCheckpoint(stopAfter: Bool = false) async throws -> URL {
+        guard let trainingControl else { throw WorkshopError("No LoRA training run is active.") }
+        let id = trainingControl.requestCheckpoint(stopAfter: stopAfter)
+        return try await trainingControl.wait(for: id)
+    }
+
+    public func resumableRuns() throws -> [WorkshopSavedRun] {
+        let runs = projectFolder.appendingPathComponent("runs", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: runs.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(at: runs, includingPropertiesForKeys: [.contentModificationDateKey])
+            .compactMap { try? savedRun(at: $0) }.sorted { $0.modified > $1.modified }
+    }
+
+    private func savedRun(at directory: URL) throws -> WorkshopSavedRun {
+        let root = projectFolder.appendingPathComponent("runs", isDirectory: true).resolvingSymlinksInPath().standardizedFileURL
+        let resolved = directory.resolvingSymlinksInPath().standardizedFileURL
+        guard resolved.deletingLastPathComponent() == root,
+              try directory.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
+            throw WorkshopError("Choose a saved run from this image folder.")
+        }
+        let request = try JSONDecoder().decode(WorkshopRunRequest.self, from: Data(contentsOf: resolved.appendingPathComponent("request.json")))
+        guard request.schema == "loom-workshop-run-v1" else { throw WorkshopError("This run lacks a supported continuation record.") }
+        let resultURL = resolved.appendingPathComponent("result.json")
+        let result = (try? JSONSerialization.jsonObject(with: Data(contentsOf: resultURL))) as? [String: Any]
+        guard result?["status"] as? String != "completed",
+              (try? validateAdapter(resolved.appendingPathComponent("adapter", isDirectory: true))) == nil else {
+            throw WorkshopError("This run has already completed.")
+        }
+        let checkpointRoot = resolved.appendingPathComponent("checkpoints", isDirectory: true)
+        guard let entries = FileManager.default.enumerator(at: checkpointRoot, includingPropertiesForKeys: [.isRegularFileKey]),
+              entries.allObjects.compactMap({ $0 as? URL }).contains(where: { url in
+                  guard url.pathExtension == "json",
+                        let state = try? JSONDecoder().decode(WorkshopCheckpointState.self, from: Data(contentsOf: url)) else { return false }
+                  return state.schema == "loom-workshop-checkpoint-v3"
+              }) else { throw WorkshopError("This run has no checkpoint with a safe continuation position.") }
+        let modified = (try? resultURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ??
+            (try? resolved.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        return WorkshopSavedRun(directory: resolved, name: request.options.name, options: request.options,
+                                updates: result?["updates"] as? Int ?? 0, modified: modified)
     }
 
     public func export(adapter: URL) async throws -> URL {

@@ -22,11 +22,19 @@ final class WorkshopModel {
     private(set) var trainedName = ""
     private(set) var exportedAdapter: URL?
     private(set) var installed = false
+    private(set) var trainingActive = false
+    private(set) var checkpointPending = false
+    private(set) var stoppingAfterSave = false
+    private(set) var latestCheckpoint: URL?
+    private(set) var savedRuns: [WorkshopSavedRun] = []
+    var selectedSavedRunID = ""
     var errorMessage: String?
     @ObservationIgnored private var project: WorkshopProject?
     @ObservationIgnored private var operation: Task<Void, Never>?
     @ObservationIgnored private var saveOperation: Task<Void, Never>?
+    @ObservationIgnored private var stopCheckpointReceipt: Task<URL, Error>?
     @ObservationIgnored private var generation = UUID()
+    @ObservationIgnored private var eventGeneration = UUID()
     @ObservationIgnored private var polling = false
     @ObservationIgnored private let rememberLocations: Bool
 
@@ -48,6 +56,9 @@ final class WorkshopModel {
         plan?.options.imageSize == options.imageSize && trainingOptionsIssue == nil &&
         !selectedDatasetIDs.isEmpty && (selectedDatasetID.isEmpty || availableDatasets.contains { $0.id == selectedDatasetID }) &&
         !options.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    var selectedSavedRun: WorkshopSavedRun? {
+        savedRuns.first { $0.id == selectedSavedRunID } ?? savedRuns.first
     }
 
     func start() {
@@ -145,8 +156,11 @@ final class WorkshopModel {
                 }.value
                 let value = try await opened.snapshot()
                 let adapter = try await opened.latestAdapter()
+                let saved = try await opened.resumableRuns()
                 guard current == generation, !Task.isCancelled else { return }
                 project = opened
+                savedRuns = saved
+                selectedSavedRunID = saved.first?.id ?? ""
                 options = value.options
                 if options.datasetIDs.count == 1 { selectedDatasetID = options.datasetIDs[0] }
                 adopt(value)
@@ -182,6 +196,8 @@ final class WorkshopModel {
         value.datasetIDs = selectedDatasetID.isEmpty ? [] : [selectedDatasetID]
         let current = generation
         let onProgress = eventHandler()
+        trainingActive = true
+        latestCheckpoint = nil
         perform("Training your LoRA", clearEvents: true) { [weak self] project in
             try await project.updateOptions(value)
             let adapter = try await project.train(options: value, progress: onProgress)
@@ -191,6 +207,94 @@ final class WorkshopModel {
             self.exportedAdapter = nil
             self.installed = false
         }
+    }
+
+    func resumeSavedRun() {
+        guard !busy, let saved = selectedSavedRun else { return }
+        options = saved.options
+        selectedDatasetID = saved.options.datasetIDs.count == 1 ? saved.options.datasetIDs[0] : ""
+        let current = generation
+        let onProgress = eventHandler()
+        trainingActive = true
+        latestCheckpoint = nil
+        perform("Resuming your LoRA", clearEvents: true) { [weak self] project in
+            let adapter = try await project.train(options: saved.options, resumeRun: saved.directory, progress: onProgress)
+            guard let self, self.generation == current else { return }
+            self.trainedAdapter = adapter
+            self.trainedName = saved.options.name
+            self.exportedAdapter = nil
+            self.installed = false
+        }
+    }
+
+    func saveCheckpoint() {
+        guard trainingActive, !checkpointPending, let project else { return }
+        checkpointPending = true
+        errorMessage = nil
+        status = "Saving the latest completed update…"
+        let current = generation
+        Task {
+            do {
+                let checkpoint = try await project.saveCheckpoint()
+                guard generation == current else { return }
+                latestCheckpoint = checkpoint
+                checkpointPending = false
+                status = "Checkpoint saved; training continues"
+            } catch {
+                guard generation == current else { return }
+                checkpointPending = false
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func saveAndStop() {
+        Task { _ = await saveAndStopAndWait() }
+    }
+
+    func saveAndStopAndWait() async -> Bool {
+        guard trainingActive, let project else { return !busy }
+        let receipt: Task<URL, Error>
+        if let existing = stopCheckpointReceipt { receipt = existing }
+        else {
+            receipt = Task { try await project.saveCheckpoint(stopAfter: true) }
+            stopCheckpointReceipt = receipt
+        }
+        stoppingAfterSave = true
+        checkpointPending = true
+        errorMessage = nil
+        status = "Saving the latest completed update, then stopping…"
+        let current = generation
+        do {
+            let checkpoint = try await receipt.value
+            guard generation == current else { return false }
+            latestCheckpoint = checkpoint
+            await operation?.value
+            stopCheckpointReceipt = nil
+            return generation == current && !busy && errorMessage == nil
+        } catch {
+            guard generation == current else { return false }
+            checkpointPending = false
+            stoppingAfterSave = false
+            stopCheckpointReceipt = nil
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func cancelAndWait() async -> Bool {
+        cancel()
+        await operation?.value
+        return !busy
+    }
+
+    func revealRuns() {
+        if let sourceFolder { NSWorkspace.shared.open(sourceFolder.appendingPathComponent(".loom-workshop/runs", isDirectory: true)) }
+    }
+
+    func revealLatestCheckpoint() {
+        if let latestCheckpoint { NSWorkspace.shared.activateFileViewerSelecting([latestCheckpoint]) }
+        else if let selectedSavedRun { NSWorkspace.shared.open(selectedSavedRun.directory) }
     }
 
     func export() {
@@ -297,19 +401,48 @@ final class WorkshopModel {
             do {
                 try Task.checkCancellation()
                 try await action(project)
-                let value = try await project.snapshot(imageSize: options.imageSize)
+                // Preserve a completed result even if a later folder refresh fails.
                 guard current == generation else { return }
-                adopt(value)
+                do {
+                    let refreshed = try await project.snapshot(imageSize: options.imageSize)
+                    guard current == generation else { return }
+                    adopt(refreshed)
+                } catch {
+                    guard current == generation else { return }
+                    folderIssue = error.localizedDescription; plan = nil
+                }
+                let resumable = (try? await project.resumableRuns()) ?? savedRuns
+                guard current == generation else { return }
+                savedRuns = resumable
                 busy = false
-                status = Task.isCancelled ? "Stopped" : "\(title) complete"
-                progress = Task.isCancelled ? nil : 1
+                trainingActive = false
+                checkpointPending = false
+                stoppingAfterSave = false
+                if !savedRuns.contains(where: { $0.id == selectedSavedRunID }) { selectedSavedRunID = savedRuns.first?.id ?? "" }
+                status = "\(title) complete"
+                progress = 1
             } catch {
                 guard current == generation else { return }
-                if Task.isCancelled || error is CancellationError {
+                let resumable = (try? await project.resumableRuns()) ?? savedRuns
+                let refreshed = try? await project.snapshot(imageSize: options.imageSize)
+                guard current == generation else { return }
+                savedRuns = resumable
+                if let refreshed { adopt(refreshed) }
+                trainingActive = false
+                checkpointPending = false
+                stoppingAfterSave = false
+                if !savedRuns.contains(where: { $0.id == selectedSavedRunID }) { selectedSavedRunID = savedRuns.first?.id ?? "" }
+                if let saved = error as? WorkshopSavedStop {
+                    latestCheckpoint = saved.checkpoint
+                    busy = false
+                    status = "Stopped; the latest checkpoint was saved"
+                    progress = nil
+                } else if error is WorkshopError, error.localizedDescription.contains("checkpoint could not be saved") {
+                    fail(error)
+                } else if Task.isCancelled || error is CancellationError {
                     busy = false
                     status = "Stopped"
                     progress = nil
-                    if let value = try? await project.snapshot(imageSize: options.imageSize) { adopt(value) }
                 } else { fail(error) }
             }
         }
@@ -317,13 +450,16 @@ final class WorkshopModel {
 
     private func eventHandler() -> @Sendable (WorkshopEvent) -> Void {
         let current = generation
+        eventGeneration = UUID()
+        let activity = eventGeneration
         return { [weak self] event in
             Task { @MainActor [weak self] in
-                guard let self, self.generation == current else { return }
+                guard let self, self.generation == current, self.eventGeneration == activity, self.busy else { return }
                 self.events.append(event)
+                if let checkpoint = event.checkpoint { self.latestCheckpoint = checkpoint }
                 if self.events.count > 200 { self.events.removeFirst(self.events.count - 200) }
                 guard self.operation?.isCancelled != true else { return }
-                self.status = event.message
+                if !self.checkpointPending { self.status = event.message }
                 if let progress = event.progress { self.progress = progress }
             }
         }
@@ -339,6 +475,9 @@ final class WorkshopModel {
         project = nil; sourceFolder = nil; folderIssue = nil; plan = nil
         selectedDatasetID = ""; options = WorkshopOptions()
         trainedAdapter = nil; trainedName = ""; exportedAdapter = nil; installed = false
+        trainingActive = false; checkpointPending = false; stoppingAfterSave = false
+        stopCheckpointReceipt = nil
+        latestCheckpoint = nil; savedRuns = []; selectedSavedRunID = ""
         events = []; errorMessage = nil
     }
 

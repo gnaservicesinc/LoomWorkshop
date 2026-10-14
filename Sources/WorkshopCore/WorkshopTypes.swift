@@ -167,10 +167,12 @@ public struct WorkshopEvent: Sendable {
     public let update: Int?
     public let totalUpdates: Int?
     public let learningRate: Double?
+    public let checkpoint: URL?
     public init(message: String, progress: Double? = nil, epoch: Int? = nil, loss: Double? = nil,
-                update: Int? = nil, totalUpdates: Int? = nil, learningRate: Double? = nil) {
+                update: Int? = nil, totalUpdates: Int? = nil, learningRate: Double? = nil, checkpoint: URL? = nil) {
         self.message = message; self.progress = progress; self.epoch = epoch; self.loss = loss
         self.update = update; self.totalUpdates = totalUpdates; self.learningRate = learningRate
+        self.checkpoint = checkpoint
     }
 }
 public struct WorkshopError: LocalizedError, Sendable {

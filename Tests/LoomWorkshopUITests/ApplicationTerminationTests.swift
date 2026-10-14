@@ -3,11 +3,71 @@ import Testing
 @testable import LoomWorkshop
 
 @Suite(.serialized)
+struct ApplicationTerminationTests {
+    @Test @MainActor
+    func keepTrainingRefusesQuitWithoutStopping() {
+        let delegate = WorkshopApplicationDelegate()
+        delegate.operationIsActive = { true }
+        delegate.trainingIsActive = { true }
+        var askedAboutTraining = false
+        var stopped = false
+        delegate.quitDecision = { training in askedAboutTraining = training; return false }
+        delegate.finishActiveOperation = { stopped = true; return true }
+        #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateCancel)
+        #expect(askedAboutTraining)
+        #expect(!stopped)
+    }
+
+    @Test @MainActor
+    func saveAndQuitWaitsForSaveThenFlushesSettings() async throws {
+        let delegate = WorkshopApplicationDelegate()
+        var active = true
+        var saved = false
+        var prepared = false
+        var reply: Bool?
+        delegate.operationIsActive = { active }
+        delegate.trainingIsActive = { true }
+        delegate.quitDecision = { _ in true }
+        delegate.finishActiveOperation = {
+            try? await Task.sleep(for: .milliseconds(25))
+            saved = true; active = false
+            return true
+        }
+        delegate.prepareForTermination = { prepared = saved; return true }
+        delegate.replyToTermination = { _, allowed in reply = allowed }
+        #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateLater)
+        #expect(reply == nil)
+        #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateLater)
+        for _ in 0..<100 where reply == nil { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(reply == true)
+        #expect(saved && prepared)
+    }
+
+    @Test @MainActor
+    func failedCheckpointRefusesQuitAndKeepsTraining() async throws {
+        let delegate = WorkshopApplicationDelegate()
+        var reply: Bool?
+        var flushed = false
+        delegate.operationIsActive = { true }
+        delegate.trainingIsActive = { true }
+        delegate.quitDecision = { _ in true }
+        delegate.finishActiveOperation = { false }
+        delegate.prepareForTermination = { flushed = true; return true }
+        delegate.replyToTermination = { _, allowed in reply = allowed }
+        #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateLater)
+        for _ in 0..<100 where reply == nil { try await Task.sleep(for: .milliseconds(5)) }
+        #expect(reply == false)
+        #expect(!flushed)
+    }
+}
+
+@Suite(.serialized)
 struct WorkshopApplicationTerminationTests {
     @Test @MainActor
     func terminationReadsCurrentOperationStateWithoutStoppingTheOperation() async throws {
         let model = WorkshopModel(rememberLocations: false)
         let delegate = WorkshopApplicationDelegate()
+        delegate.quitDecision = { _ in false }
         delegate.bind(to: model)
         var replies: [Bool] = []
         delegate.replyToTermination = { _, allowed in replies.append(allowed) }
@@ -34,6 +94,7 @@ struct WorkshopApplicationTerminationTests {
     @Test @MainActor
     func terminationDelegateDoesNotKeepTheWorkspaceAlive() async {
         let delegate = WorkshopApplicationDelegate()
+        delegate.quitDecision = { _ in false }
         var model: WorkshopModel? = WorkshopModel(rememberLocations: false)
         weak var workspace = model
         delegate.bind(to: model!)
@@ -46,6 +107,7 @@ struct WorkshopApplicationTerminationTests {
     @Test @MainActor
     func idleTerminationWaitsForOneSaveAndRechecksForNewWork() async throws {
         let delegate = WorkshopApplicationDelegate()
+        delegate.quitDecision = { _ in false }
         #expect(delegate.applicationShouldTerminate(NSApplication.shared) == .terminateNow)
         var active = false
         var preparations = 0

@@ -26,6 +26,8 @@ struct NativeWorkshopEngine: Sendable {
     let options: WorkshopOptions
     let cancellation: NativeCancellation
     let progress: @Sendable (WorkshopEvent) -> Void
+    var control: WorkshopTrainingControl? = nil
+    var resuming = false
 
     func plan() throws {
         try cancellation.check()
@@ -37,7 +39,21 @@ struct NativeWorkshopEngine: Sendable {
     func train(run: URL) throws -> URL {
         defer { NativeImages.clearDecodedPixelCache() }
         var updates = 0
-        var saveStoppedUpdate: (() throws -> Void)?
+        var saveStoppedUpdate: (() throws -> URL)?
+        var continuationAccepted = !resuming
+        func processCheckpointRequest() throws {
+            guard let saveStoppedUpdate, let request = control?.takeRequest() else { return }
+            let saved: URL
+            do { saved = try saveStoppedUpdate() }
+            catch {
+                control?.complete(request.ids, result: .failure(WorkshopError("Checkpoint could not be saved: \(error.localizedDescription). Training is still running.")))
+                emit(.init(message: "Checkpoint save failed; training is still running: \(error.localizedDescription)"), run: run)
+                return
+            }
+            control?.complete(request.ids, result: .success(saved))
+            emit(.init(message: "Checkpoint saved; \(request.stop ? "stopping safely" : "training continues")", update: updates, checkpoint: saved), run: run)
+            if request.stop { throw WorkshopSavedStop(checkpoint: saved) }
+        }
         do {
             try options.validate()
             try cancellation.check()
@@ -59,8 +75,20 @@ struct NativeWorkshopEngine: Sendable {
                 let state = try identity(path)
                 fingerprints[path] = ImageFingerprint(bytes: state.0, modified: state.1, sha256: try fileSHA(path, cancellation: cancellation), membership: try membershipSignature(path))
             }
+            let sourceSignature = try Self.sourceSignature(fingerprints)
+            if resuming {
+                let request = try JSONDecoder().decode(WorkshopRunRequest.self, from: Data(contentsOf: run.appendingPathComponent("request.json")))
+                guard request.options == options, request.baseID == studio.modelID, request.baseVersion == studio.version,
+                      request.sourceSignature == sourceSignature else {
+                    throw WorkshopError("The saved run's settings, images, image metadata or installed base changed. Start a new run to use those changes.")
+                }
+                continuationAccepted = true
+            } else {
+                try JSONEncoder().encode(WorkshopRunRequest(options: options, baseID: studio.modelID,
+                    baseVersion: studio.version, sourceSignature: sourceSignature)).write(to: run.appendingPathComponent("request.json"), options: .atomic)
+            }
             let package = run.appendingPathComponent("adapter", isDirectory: true)
-            try FileManager.default.createDirectory(at: package, withIntermediateDirectories: false)
+            try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
             var adapters: [String: [[String: String]]] = [:]
             var sampler = NativeAugmentationPlan(seed: options.seed, cropRefresh: options.cropRefresh.rawValue,
                                                   augmentationRefresh: options.augmentationRefresh.rawValue)
@@ -86,24 +114,44 @@ struct NativeWorkshopEngine: Sendable {
                 }
                 let architecture = try NativeArchitecture(mapKind: artifact.map, width: width, blocks: blocks, identifier: artifact.architecture)
                 let frozen = try NativeWeights.read(from: baseWeightsURL)
+                let restored = resuming ? try restoreCheckpoint(run: run, category: category, map: artifact.map,
+                    baseHash: baseHash, studio: studio, memberCount: members.count) : nil
+                if let restored {
+                    sampler = restored.state.samplingState
+                    orderGenerator.state = UInt64(restored.state.orderState)!
+                    updates += restored.state.updates
+                }
                 let nativeOptions = try NativeTrainingOptions(optimizer: options.optimizer.rawValue, weightDecay: options.weightDecay,
                     beta1: options.optimizer == .sgd ? 0.9 : options.beta1,
                     beta2: options.optimizer == .sgd ? 0.999 : options.beta2,
                     momentum: options.optimizer == .sgd ? options.momentum : 0.9, gradientClipNorm: options.maxGradientNorm)
                 let session = try NativeTrainingSession(architecture: architecture, options: nativeOptions, seed: UInt64(options.seed),
                     weights: frozen, adapter: NativeAdapterConfiguration(rank: options.rank, alpha: options.alpha),
+                    adapterWeights: restored?.weights, optimizerState: restored?.optimizer, initialUpdateCount: restored?.state.updates ?? 0,
                     device: options.device.rawValue, cancellation: cancellation, channelsLast: !architecture.isPyramid)
                 let stepsPerEpoch = Self.stepsPerEpoch(samples: members.count, options: options)
                 let groupTotal = stepsPerEpoch * options.epochs
                 let baseParameters = frozen.values.reduce(0) { $0 + $1.values.count }
                 let trainableParameters = try session.adapterWeights().values.reduce(0) { $0 + $1.values.count }
                 emit(.init(message: "\(category.name) \(artifact.map): \(trainableParameters.formatted()) trainable LoRA parameters"), run: run)
-                var finalLoss = 0.0
-                for epoch in 0..<options.epochs {
-                    var order = Array(members.indices)
-                    if options.shuffleEachEpoch { order.shuffle(using: &orderGenerator) }
+                var finalLoss = restored?.state.finalLoss ?? 0.0
+                if let restored {
+                    let savedSampler = sampler, savedOrder = orderGenerator.state, savedLoss = finalLoss
+                    saveStoppedUpdate = {
+                        try checkpoint(session: session, run: run, category: category, map: artifact.map, epoch: restored.state.epoch,
+                            baseHash: baseHash, loss: savedLoss, sampler: savedSampler, orderState: savedOrder,
+                            studio: studio, stopped: true, epochCompleted: restored.state.epochCompleted,
+                            nextBatch: restored.state.nextBatch, epochOrder: restored.state.epochOrder)
+                    }
+                }
+                let startEpoch = restored.map { $0.state.epochCompleted ? $0.state.epoch : $0.state.epoch - 1 } ?? 0
+                for epoch in startEpoch..<options.epochs {
+                    let continuingEpoch = restored?.state.epochCompleted == false && epoch == startEpoch
+                    var order = continuingEpoch ? restored!.state.epochOrder : Array(members.indices)
+                    if options.shuffleEachEpoch && !continuingEpoch { order.shuffle(using: &orderGenerator) }
                     let batches = stride(from: 0, to: order.count, by: options.batchSize).map { Array(order[$0..<min(order.count, $0 + options.batchSize)]) }
-                    for start in stride(from: 0, to: batches.count, by: options.gradientAccumulationSteps) {
+                    let nextBatch = continuingEpoch ? restored!.state.nextBatch : 0
+                    for start in stride(from: nextBatch, to: batches.count, by: options.gradientAccumulationSteps) {
                         let window = batches[start..<min(batches.count, start + options.gradientAccumulationSteps)]
                         let windowSamples = window.reduce(0) { $0 + $1.count }
                         var loss = 0.0
@@ -127,25 +175,34 @@ struct NativeWorkshopEngine: Sendable {
                         }
                         try cancellation.check()
                         let rate = Self.learningRate(step: session.updateCount, total: groupTotal, stepsPerEpoch: stepsPerEpoch, options: options)
-                        _ = try session.applyGradients(learningRate: rate)
                         guard loss.isFinite else { throw WorkshopError("LoRA training produced a non-finite loss; no adapter was published.") }
+                        _ = try session.applyGradients(learningRate: rate)
                         finalLoss = loss; updates += 1
                         let checkpointSampler = sampler, checkpointOrder = orderGenerator.state
+                        let next = min(batches.count, start + options.gradientAccumulationSteps)
+                        let completed = next == batches.count
                         saveStoppedUpdate = {
                             try checkpoint(session: session, run: run, category: category, map: artifact.map, epoch: epoch + 1,
                                 baseHash: baseHash, loss: loss, sampler: checkpointSampler, orderState: checkpointOrder,
-                                studio: studio, stopped: true)
+                                studio: studio, stopped: true, epochCompleted: completed, nextBatch: next, epochOrder: order)
                         }
                         emit(.init(message: "\(category.name) · \(artifact.map) · epoch \(epoch + 1) of \(options.epochs) · update \(session.updateCount)",
                             progress: Double(updates) / Double(totalUpdates), epoch: epoch + 1, loss: loss,
                             update: updates, totalUpdates: totalUpdates, learningRate: rate), run: run)
+                        if session.updateCount == 1 {
+                            let saved = try saveStoppedUpdate!()
+                            emit(.init(message: "First completed update saved", update: updates, checkpoint: saved), run: run)
+                        }
+                        try processCheckpointRequest()
                     }
                     if (epoch + 1) % options.checkpointEveryEpochs == 0 || epoch + 1 == options.epochs {
-                        try checkpoint(session: session, run: run, category: category, map: artifact.map, epoch: epoch + 1,
-                            baseHash: baseHash, loss: finalLoss, sampler: sampler, orderState: orderGenerator.state, studio: studio)
-                        emit(.init(message: "Saved \(category.name) \(artifact.map) LoRA checkpoint for epoch \(epoch + 1)", epoch: epoch + 1), run: run)
+                        let saved = try checkpoint(session: session, run: run, category: category, map: artifact.map, epoch: epoch + 1,
+                            baseHash: baseHash, loss: finalLoss, sampler: sampler, orderState: orderGenerator.state,
+                            studio: studio, nextBatch: batches.count, epochOrder: order)
+                        emit(.init(message: "Saved \(category.name) \(artifact.map) LoRA checkpoint for epoch \(epoch + 1)", epoch: epoch + 1, checkpoint: saved), run: run)
                     }
                 }
+                try processCheckpointRequest()
                 try cancellation.check()
                 guard try session.weights() == frozen, try fileSHA(baseWeightsURL, cancellation: cancellation) == baseHash else {
                     throw WorkshopError("Frozen base weights changed; adapter export was stopped.")
@@ -174,7 +231,6 @@ struct NativeWorkshopEngine: Sendable {
                     "quality_note": "Adapter completion does not measure prediction quality on unseen materials."],
                     to: folder.appendingPathComponent("adapter.json"))
                 emit(.init(message: "\(category.name) \(artifact.map) LoRA exported and checked"), run: run)
-                saveStoppedUpdate = nil
             }
             try cancellation.check()
             try verify(Array(paths), fingerprints: fingerprints, checkBytes: true)
@@ -183,27 +239,43 @@ struct NativeWorkshopEngine: Sendable {
                 throw WorkshopError("Texture Studio's built-in package changed during training. Reload the application before training.")
             }
             var files: [[String: String]] = []
+            let packageRoot = package.resolvingSymlinksInPath().standardizedFileURL.path
             let entries = FileManager.default.enumerator(at: package, includingPropertiesForKeys: [.isRegularFileKey])!
-            for case let file as URL in entries where try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
+            for case let file as URL in entries {
+                let canonical = file.resolvingSymlinksInPath().standardizedFileURL.path
+                guard canonical != packageRoot + "/manifest.json",
+                      try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true else { continue }
+                guard canonical.hasPrefix(packageRoot + "/") else { throw WorkshopError("An adapter artifact is outside this run folder.") }
                 try cancellation.check()
-                files.append(["path": String(file.path.dropFirst(package.path.count + 1)), "sha256": try fileSHA(file, cancellation: cancellation)])
+                files.append(["path": String(canonical.dropFirst(packageRoot.count + 1)), "sha256": try fileSHA(file, cancellation: cancellation)])
             }
             let assembled: [String: Any] = ["schema": "texture-loom.adapter.v1", "id": UUID().uuidString.lowercased(), "name": options.name,
                 "version": "1.0.0", "baseModel": ["id": studio.modelID, "version": studio.version],
                 "categories": manifest.categories.filter { adapters[$0.id] != nil }.map { ["id": $0.id, "version": $0.version, "adapters": adapters[$0.id]!] as [String: Any] },
                 "files": files.sorted { $0["path"]! < $1["path"]! }, "createdAt": ISO8601DateFormatter().string(from: Date())]
-            try cancellation.check()
-            try Self.json(assembled, to: package.appendingPathComponent("manifest.json"))
+            try processCheckpointRequest()
             try cancellation.check()
             try Self.json(["status": "completed", "backend": "native-mpsgraph", "updates": updates,
                 "base_weights_frozen": true, "originals_preserved": true], to: run.appendingPathComponent("result.json"))
-            try cancellation.check()
+            // The completion manifest is the final commit. No cancellation or
+            // optional follow-up can unpublish a fully checked adapter afterward.
+            try Self.json(assembled, to: package.appendingPathComponent("manifest.json"))
             return package
         } catch {
-            if error is CancellationError { try? saveStoppedUpdate?() }
+            guard continuationAccepted else { throw error }
+            var checkpointSaveError: Error?
+            var latestCheckpoint: URL?
+            if let saved = error as? WorkshopSavedStop { latestCheckpoint = saved.checkpoint }
+            else if let saveStoppedUpdate {
+                do { latestCheckpoint = try saveStoppedUpdate() }
+                catch { checkpointSaveError = error }
+            }
             try? FileManager.default.removeItem(at: run.appendingPathComponent("adapter/manifest.json"))
-            try? Self.json(["status": error is CancellationError ? "cancelled" : "failed", "backend": "native-mpsgraph",
-                "updates": updates, "message": error.localizedDescription], to: run.appendingPathComponent("result.json"))
+            let status = error is WorkshopSavedStop ? "saved-stop" : (error is CancellationError ? "cancelled" : "failed")
+            let message = checkpointSaveError.map { "\(error.localizedDescription) The latest checkpoint could not be saved: \($0.localizedDescription)" } ?? error.localizedDescription
+            try? Self.json(["status": status, "backend": "native-mpsgraph", "updates": updates,
+                "checkpoint_saved": latestCheckpoint != nil, "message": message], to: run.appendingPathComponent("result.json"))
+            if let checkpointSaveError { throw WorkshopError("The latest checkpoint could not be saved: \(checkpointSaveError.localizedDescription). Earlier checkpoint files are preserved in the run folder.") }
             throw error
         }
     }
@@ -329,7 +401,8 @@ struct NativeWorkshopEngine: Sendable {
 
     private func checkpoint(session: NativeTrainingSession, run: URL, category: BaseManifest.Category, map: String,
                             epoch: Int, baseHash: String, loss: Double, sampler: NativeAugmentationPlan,
-                            orderState: UInt64, studio: StudioBase, stopped: Bool = false) throws {
+                            orderState: UInt64, studio: StudioBase, stopped: Bool = false, epochCompleted: Bool = true,
+                            nextBatch: Int, epochOrder: [Int]) throws -> URL {
         if !stopped { try cancellation.check() }
         let directory = run.appendingPathComponent("checkpoints/" + Self.folderID(category.id) + "/" + map, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -337,13 +410,73 @@ struct NativeWorkshopEngine: Sendable {
         try NativeWeights.write(session.adapterWeights(), to: directory.appendingPathComponent(prefix + ".safetensors"),
             metadata: ["rank": String(options.rank), "alpha": String(options.alpha)])
         try NativeWeights.write(session.optimizerState(), to: directory.appendingPathComponent(prefix + ".optimizer.safetensors"))
-        try Self.json(["schema": "loom-workshop-checkpoint-v2", "backend": "native-mpsgraph", "epoch": epoch,
-            "updates": session.updateCount, "epoch_completed": !stopped, "base_id": studio.modelID, "base_version": studio.version,
+        let descriptor = directory.appendingPathComponent(prefix + ".json")
+        try Self.json(["schema": "loom-workshop-checkpoint-v3", "backend": "native-mpsgraph", "epoch": epoch,
+            "updates": session.updateCount, "epoch_completed": epochCompleted, "base_id": studio.modelID, "base_version": studio.version,
             "category_id": category.id, "category_version": category.version, "map": map, "base_sha256": baseHash,
             "final_loss": loss, "rank": options.rank, "alpha": options.alpha, "options": try Self.dictionary(options),
             "weights_path": prefix + ".safetensors", "optimizer_path": prefix + ".optimizer.safetensors",
-            "sampling_state": try Self.dictionary(sampler), "order_state": String(orderState)],
-            to: directory.appendingPathComponent(prefix + ".json"))
+            "weights_sha256": try fileSHA(directory.appendingPathComponent(prefix + ".safetensors")),
+            "optimizer_sha256": try fileSHA(directory.appendingPathComponent(prefix + ".optimizer.safetensors")),
+            "sampling_state": try Self.dictionary(sampler), "order_state": String(orderState),
+            "next_batch": nextBatch, "epoch_order": epochOrder], to: descriptor)
+        return descriptor
+    }
+
+    private struct RestoredCheckpoint {
+        let state: WorkshopCheckpointState
+        let weights: [String: NativeTensor]
+        let optimizer: [String: NativeTensor]
+    }
+
+    private func restoreCheckpoint(run: URL, category: BaseManifest.Category, map: String, baseHash: String,
+                                   studio: StudioBase, memberCount: Int) throws -> RestoredCheckpoint? {
+        let directory = run.appendingPathComponent("checkpoints/" + Self.folderID(category.id) + "/" + map, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: directory.path) else { return nil }
+        let checkpoints = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }.compactMap { url -> (URL, WorkshopCheckpointState)? in
+                guard let state = try? JSONDecoder().decode(WorkshopCheckpointState.self, from: Data(contentsOf: url)),
+                      state.schema == "loom-workshop-checkpoint-v3" else { return nil }
+                return (url, state)
+            }.sorted { left, right in
+                if left.1.updates != right.1.updates { return left.1.updates > right.1.updates }
+                return left.1.epochCompleted && !right.1.epochCompleted
+            }
+        guard let (_, state) = checkpoints.first else { return nil }
+        let batchCount = (memberCount + options.batchSize - 1) / options.batchSize
+        guard state.baseID == studio.modelID, state.baseVersion == studio.version, state.categoryID == category.id,
+              state.categoryVersion == category.version, state.map == map, state.baseSHA256 == baseHash,
+              state.options == options, state.updates >= 0, state.finalLoss.isFinite,
+              (1...options.epochs).contains(state.epoch), UInt64(state.orderState) != nil,
+              state.epochOrder.count == memberCount, Set(state.epochOrder) == Set(0..<memberCount),
+              (0...batchCount).contains(state.nextBatch),
+              state.epochCompleted ? state.nextBatch == batchCount : (state.nextBatch < batchCount && state.nextBatch % options.gradientAccumulationSteps == 0) else {
+            throw WorkshopError("The saved checkpoint does not match this base, dataset or continuation position.")
+        }
+        func checkedFile(_ path: String, hash: String) throws -> URL {
+            guard !path.isEmpty, URL(fileURLWithPath: path).lastPathComponent == path else {
+                throw WorkshopError("A checkpoint file path is invalid.")
+            }
+            let url = directory.appendingPathComponent(path)
+            guard url.resolvingSymlinksInPath().deletingLastPathComponent() == directory.resolvingSymlinksInPath(),
+                  try fileSHA(url, cancellation: cancellation) == hash else {
+                throw WorkshopError("A checkpoint file is missing or changed. Earlier saved checkpoints remain in the run folder.")
+            }
+            return url
+        }
+        return RestoredCheckpoint(state: state,
+            weights: try NativeWeights.read(from: checkedFile(state.weightsPath, hash: state.weightsSHA256)),
+            optimizer: try NativeWeights.read(from: checkedFile(state.optimizerPath, hash: state.optimizerSHA256)))
+    }
+
+    private static func sourceSignature(_ fingerprints: [URL: ImageFingerprint]) throws -> String {
+        let records = fingerprints.keys.sorted { $0.path < $1.path }.map { url in
+            let proof = fingerprints[url]!
+            return ["path": url.resolvingSymlinksInPath().standardizedFileURL.path,
+                    "sha256": proof.sha256, "membership": proof.membership.base64EncodedString()]
+        }
+        return SHA256.hash(data: try JSONSerialization.data(withJSONObject: records, options: [.sortedKeys]))
+            .map { String(format: "%02x", $0) }.joined()
     }
 
     private func compatibilityProof(session: NativeTrainingSession, compiled: URL, map: String) throws -> Double {

@@ -7,7 +7,7 @@ if let path = ProcessInfo.processInfo.environment["LOOM_NATIVE_DEVELOPMENT_PATH"
     nativeDependency = .package(path: path)
 } else {
     nativeDependency = .package(url: "https://github.com/gnaservicesinc/LoomFactory.git",
-        revision: "f7365ad62712a5ebd100b9942031ba3ae155e8f3")
+        revision: "3a8801666df2de6c44b7b478d09f9078a1fee8de")
 }
 
 let package = Package(

@@ -117,6 +117,80 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(NativeWorkshopEngine.learningRate(step: 2, total: 6, stepsPerEpoch: 2, options: options), 0.001, accuracy: 1e-12)
         XCTAssertEqual(NativeWorkshopEngine.learningRate(step: 5, total: 6, stepsPerEpoch: 2, options: options), 0.0001, accuracy: 1e-12)
     }
+
+    func testManualCheckpointThenSaveAndStopResumesExactPartialEpoch() async throws {
+        let fixture = try NativeWorkshopFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        for index in 1...2 {
+            for (original, role) in [(fixture.diffuse, "diffuse"), (fixture.target, "depth")] {
+                let copied = fixture.images.appendingPathComponent("brick\(index)_\(role).png")
+                try FileManager.default.copyItem(at: original, to: copied)
+                let tag = try JSONSerialization.data(withJSONObject: ["id": UUID().uuidString,
+                    "pairingKey": "pair-\(index)", "role": role, "category": "Bricks", "ignored": false])
+                let status = tag.withUnsafeBytes { setxattr(copied.path, "com.gnaservicesinc.loomfactory.image.v1", $0.baseAddress, tag.count, 0, 0) }
+                XCTAssertEqual(status, 0)
+            }
+        }
+        let project = try WorkshopProject(sourceFolder: fixture.images, textureStudio: fixture.application)
+        var options = WorkshopOptions(); options.imageSize = 32; options.epochs = 3; options.rank = 2; options.alpha = 2
+        options.batchSize = 1; options.gradientAccumulationSteps = 2; options.flipCrops = true
+        options.rotateCrops = true; options.shuffleEachEpoch = true; options.checkpointEveryEpochs = 100_000
+        options.learningRateSchedule = .cosine; options.warmupEpochs = 1
+        let reference = try await project.train(options: options, progress: { _ in })
+        let run = project.projectFolder.appendingPathComponent("runs/manual-stop", isDirectory: true)
+        try FileManager.default.createDirectory(at: run, withIntermediateDirectories: true)
+        let control = WorkshopTrainingControl()
+        let receiptIDs = WorkshopReceiptIDs()
+        let engine = NativeWorkshopEngine(source: fixture.images, project: project.projectFolder, application: fixture.application,
+            options: options, cancellation: NativeCancellation(), progress: { event in
+                if event.update == 1 && event.loss != nil { receiptIDs.add(control.requestCheckpoint(stopAfter: false)) }
+                if event.update == 3 && event.loss != nil { receiptIDs.add(control.requestCheckpoint(stopAfter: true)) }
+            }, control: control)
+        do { _ = try await Task.detached { try engine.train(run: run) }.value; XCTFail("Save & Stop must end the run after saving.") }
+        catch is WorkshopSavedStop {} catch { XCTFail("Unexpected stop error: \(error)") }
+        for id in receiptIDs.values { _ = try await control.wait(for: id) }
+        XCTAssertEqual(receiptIDs.values.count, 2)
+        let saved = try await project.resumableRuns()
+        let selected = try XCTUnwrap(saved.first { $0.id == run.lastPathComponent })
+        XCTAssertEqual(selected.updates, 3)
+        let result = try JSONSerialization.jsonObject(with: Data(contentsOf: run.appendingPathComponent("result.json"))) as! [String: Any]
+        XCTAssertEqual(result["status"] as? String, "saved-stop")
+        let checkpointFiles = try FileManager.default.subpathsOfDirectory(atPath: run.appendingPathComponent("checkpoints").path)
+        let partialPath = try XCTUnwrap(checkpointFiles.first { $0.hasSuffix("stopped-update-000000003.json") })
+        let checkpoint = try JSONDecoder().decode(WorkshopCheckpointState.self, from: Data(contentsOf: run.appendingPathComponent("checkpoints/" + partialPath)))
+        XCTAssertFalse(checkpoint.epochCompleted)
+        XCTAssertEqual(checkpoint.epoch, 2)
+        XCTAssertEqual(checkpoint.nextBatch, 2)
+        let resumed: URL
+        do { resumed = try await project.train(options: options, resumeRun: selected.directory, progress: { _ in }) }
+        catch {
+            XCTFail("Resume failed: \(error.localizedDescription). Run files: \(try FileManager.default.subpathsOfDirectory(atPath: run.path)). Result: \(String(data: try Data(contentsOf: run.appendingPathComponent("result.json")), encoding: .utf8) ?? "")")
+            throw error
+        }
+        func adapterWeights(_ package: URL) throws -> [String: NativeTensor] {
+            let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: package.appendingPathComponent("manifest.json"))) as! [String: Any]
+            let category = (manifest["categories"] as! [[String: Any]])[0]
+            let model = (category["adapters"] as! [[String: Any]])[0]
+            return try NativeWeights.read(from: package.appendingPathComponent(model["weightsPath"] as! String))
+        }
+        let expected = try adapterWeights(reference), actual = try adapterWeights(resumed)
+        XCTAssertEqual(Set(expected.keys), Set(actual.keys))
+        for name in expected.keys {
+            let difference = zip(expected[name]!.values, actual[name]!.values).map { abs($0 - $1) }.max() ?? 0
+            XCTAssertLessThanOrEqual(difference, 0.0000001, name)
+        }
+        let remaining = try await project.resumableRuns()
+        XCTAssertFalse(remaining.contains { $0.id == run.lastPathComponent })
+        XCTAssertEqual(try Data(contentsOf: fixture.diffuse), fixture.originalDiffuse)
+        XCTAssertEqual(try Data(contentsOf: fixture.target), fixture.originalTarget)
+    }
+}
+
+private final class WorkshopReceiptIDs: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [UUID] = []
+    func add(_ id: UUID) { lock.withLock { stored.append(id) } }
+    var values: [UUID] { lock.withLock { stored } }
 }
 
 private struct NativeWorkshopFixture {
