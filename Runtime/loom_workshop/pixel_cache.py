@@ -39,8 +39,19 @@ class DecodedImageCache:
                 return pixels
             self.cached_bytes -= pixels.nbytes
         self.misses += 1
-        pixels = np.ascontiguousarray(loader(path))
-        if file_identity(path) != identity:
+        for attempt in range(2):
+            pixels = np.ascontiguousarray(loader(path))
+            current = file_identity(path)
+            if current == identity:
+                break
+            # Review notes and flags can update ctime while ImageIO/Pillow reads
+            # unchanged pixels. Discard that decode and retry from the new file
+            # identity once. Keep ctime in cache keys: a byte rewrite followed by
+            # restored mtime must still invalidate previously cached pixels.
+            if attempt == 0 and all(before[:4] == after[:4] for before, after in zip(identity, current)):
+                identity = current
+                del pixels
+                continue
             raise ValueError(f"An image changed while its pixels were read: {Path(path).name}")
         if pixels.nbytes <= self.maximum_bytes:
             while self._entries and self.cached_bytes + pixels.nbytes > self.maximum_bytes:

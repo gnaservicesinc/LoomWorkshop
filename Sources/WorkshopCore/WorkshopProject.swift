@@ -139,10 +139,7 @@ public actor WorkshopProject {
         Dictionary(uniqueKeysWithValues: actual.files.map { ($0.path, $0.sha256) }) == Dictionary(uniqueKeysWithValues: expected.files.map { ($0.path, $0.sha256) })
     }
     private func validate(_ options: WorkshopOptions) throws {
-        guard !options.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              (32...8192).contains(options.imageSize), (1...100_000).contains(options.epochs),
-              (1...128).contains(options.rank), options.learningRate.isFinite, options.learningRate > 0,
-              Set(options.datasetIDs).count == options.datasetIDs.count else { throw WorkshopError("Choose a name, valid training dimensions, positive epochs and learning rate for your LoRA.") }
+        try options.validate()
     }
     private func run(command: String, options: WorkshopOptions, progress: @escaping @Sendable (WorkshopEvent) -> Void) async throws -> URL {
         try validate(options)
@@ -161,10 +158,16 @@ public actor WorkshopProject {
             "output_directory": run.path, "texture_studio_path": textureStudio.path, "base_root": studio.packageURL.path,
             "base_id": studio.modelID, "base_version": studio.version, "adapter_name": options.name,
             "selected_category_ids": options.datasetIDs, "samples": input, "image_size": options.imageSize,
-            "epochs": options.epochs, "batch_size": 1, "learning_rate": options.learningRate,
-            "rank": options.rank, "alpha": options.rank, "shuffle_each_epoch": options.shuffleEachEpoch,
-            "flip_crops": options.flipCrops, "rotate_crops": false, "exaggerate_features": options.exaggerateFeatures,
-            "seed": 42, "device": "auto"]
+            "epochs": options.epochs, "batch_size": options.batchSize, "learning_rate": options.learningRate,
+            "gradient_accumulation_steps": options.gradientAccumulationSteps, "optimizer": options.optimizer.rawValue,
+            "weight_decay": options.weightDecay, "beta1": options.beta1, "beta2": options.beta2,
+            "momentum": options.momentum, "gradient_clip_norm": options.maxGradientNorm,
+            "lr_schedule": options.learningRateSchedule.rawValue, "warmup_epochs": options.warmupEpochs,
+            "minimum_lr_ratio": options.minimumLearningRateRatio,
+            "crop_refresh": options.cropRefresh.rawValue, "augmentation_refresh": options.augmentationRefresh.rawValue,
+            "rank": options.rank, "alpha": options.alpha, "shuffle_each_epoch": options.shuffleEachEpoch,
+            "flip_crops": options.flipCrops, "rotate_crops": options.rotateCrops, "exaggerate_features": options.exaggerateFeatures,
+            "seed": options.seed, "device": options.device.rawValue, "checkpoint_every_epochs": options.checkpointEveryEpochs]
         let requestFile = run.appendingPathComponent("request.json")
         try JSONSerialization.data(withJSONObject: request, options: [.prettyPrinted, .sortedKeys]).write(to: requestFile, options: .atomic)
         let runtime = try runtimeCode()
@@ -216,7 +219,9 @@ public actor WorkshopProject {
                         if let message = event["message"] as? String {
                             if type == "error" { lastError = message }
                             progress(WorkshopEvent(message: message, progress: (event["progress"] as? NSNumber)?.doubleValue,
-                                epoch: event["epoch"] as? Int, loss: (event["loss"] as? NSNumber)?.doubleValue))
+                                epoch: event["epoch"] as? Int, loss: (event["loss"] as? NSNumber)?.doubleValue,
+                                update: event["update"] as? Int, totalUpdates: event["total_updates"] as? Int,
+                                learningRate: (event["learning_rate"] as? NSNumber)?.doubleValue))
                         }
                     }
                 }

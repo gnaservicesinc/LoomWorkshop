@@ -11,6 +11,35 @@ import UniformTypeIdentifiers
 @Suite(.serialized)
 struct WorkshopViewTests {
     @Test @MainActor
+    func advancedControlsRenderAndRejectInvalidTrainingSettings() async throws {
+        let fixture = try await WorkshopViewFixture()
+        defer { fixture.remove() }
+        let model = WorkshopModel(rememberLocations: false)
+        try await open(model, fixture)
+        let profile = try #require(model.studio?.categories.first?.modelProfiles?.first)
+        #expect(profile.baseParameters == 42_553)
+        model.options.optimizer = .lion
+        model.options.beta2 = 0.99
+        model.options.batchSize = 2
+        model.options.gradientAccumulationSteps = 4
+        model.options.cropRefresh = .run
+        model.options.augmentationRefresh = .epoch
+        #expect(model.options.effectiveBatchSize == 8)
+        #expect(model.canTrain)
+        for size in [NSSize(width: 1000, height: 720), NSSize(width: 1180, height: 940), NSSize(width: 1000, height: 2200)] {
+            try await render(model, size: size, name: "loom-workshop-\(Int(size.width))x\(Int(size.height))-advanced.png", advanced: true)
+        }
+        model.options.gradientAccumulationSteps = 0
+        #expect(!model.canTrain)
+        model.options.gradientAccumulationSteps = 4
+        model.options.beta2 = 1
+        #expect(!model.canTrain)
+        model.options.epochs = Int.min
+        model.options.rank = Int.max
+        #expect(!model.canTrain)
+        try await render(model, size: NSSize(width: 1000, height: 720), name: "loom-workshop-invalid-options.png", advanced: true)
+    }
+    @Test @MainActor
     func nativeWorkflowRendersAtMinimumAndDefaultSizes() async throws {
         let fixture = try await WorkshopViewFixture()
         defer { fixture.remove() }
@@ -173,9 +202,9 @@ struct WorkshopViewTests {
         if expectsProject { _ = try #require(model.plan) }
     }
 
-    @MainActor private func render(_ model: WorkshopModel, size: NSSize, name: String) async throws {
+    @MainActor private func render(_ model: WorkshopModel, size: NSSize, name: String, advanced: Bool = false) async throws {
         _ = NSApplication.shared
-        let content = NSHostingView(rootView: WorkshopView(model: model, startsAutomatically: false).tint(WorkshopStyle.accent))
+        let content = NSHostingView(rootView: WorkshopView(model: model, startsAutomatically: false, showsAdvancedOptionsInitially: advanced).tint(WorkshopStyle.accent))
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = content
@@ -213,12 +242,13 @@ private struct WorkshopViewFixture {
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
             .write(to: application.appendingPathComponent("Contents/Info.plist"))
         // These small fixture artifacts exercise folder/catalog state only. They are never used for inference or training.
-        let artifactPaths = ["classifier/model.mlpackage/data", "classifier/weights.safetensors", "bricks/depth/model.mlpackage/data", "bricks/depth/weights.safetensors"]
+        let artifactPaths = ["classifier/model.mlpackage/data", "classifier/weights.safetensors", "bricks/depth/model.mlpackage/data", "bricks/depth/weights.safetensors", "bricks/depth/model.json"]
         var files: [[String: String]] = []
         for path in artifactPaths {
             let file = package.appendingPathComponent(path)
             try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = Data("Catalog fixture: \(path)".utf8)
+            let data = path.hasSuffix("model.json") ?
+                try JSONSerialization.data(withJSONObject: ["architecture_config": ["id": "loom-factory-material-residual-v1", "width": 24, "blocks": 4]]) : Data("Catalog fixture: \(path)".utf8)
             try data.write(to: file)
             files.append(["path": path, "sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()])
         }
@@ -230,7 +260,7 @@ private struct WorkshopViewFixture {
                            "labels": [["id": datasetID, "name": "Bricks"]]],
             "categories": [["id": datasetID, "name": "Bricks", "version": "1.0.0", "models": [[
                 "map": "depth", "path": "bricks/depth/model.mlpackage", "weightsPath": "bricks/depth/weights.safetensors",
-                "architecture": "loom-map-v1"
+                "architecture": "loom-factory-material-residual-v1"
             ]]]], "files": files
         ]
         try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])

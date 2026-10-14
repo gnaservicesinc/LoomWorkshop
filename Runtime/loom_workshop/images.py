@@ -169,7 +169,8 @@ def exaggerate_depth(value: torch.Tensor) -> torch.Tensor:
 
 
 def native_pair(sample: dict, size: int, rng: random.Random, map_kind: str,
-                flip: bool, rotate: bool, exaggerate: bool, cache=None):
+                flip: bool, rotate: bool, exaggerate: bool, cache=None, augmentation_rng=None):
+    augmentation_rng = augmentation_rng or rng
     convention = sample.get("normal_convention", "OpenGL")
     if cache is None:
         rgb = read_rgb(sample["input"])
@@ -186,15 +187,17 @@ def native_pair(sample: dict, size: int, rng: random.Random, map_kind: str,
     left, top = rng.randrange(width - size + 1), rng.randrange(height - size + 1)
     rgb = rgb[top:top + size, left:left + size].copy()
     target = target[top:top + size, left:left + size].copy()
-    if flip and rng.random() < 0.5:
+    horizontal_flip = flip and augmentation_rng.random() < 0.5
+    vertical_flip = flip and augmentation_rng.random() < 0.5
+    if horizontal_flip:
         rgb, target = rgb[:, ::-1].copy(), target[:, ::-1].copy()
         if map_kind == "normal":
             target[..., 0] = 1.0 - target[..., 0]
-    if flip and rng.random() < 0.5:
+    if vertical_flip:
         rgb, target = rgb[::-1].copy(), target[::-1].copy()
         if map_kind == "normal":
             target[..., 1] = 1.0 - target[..., 1]
-    turns = rng.randrange(4) if rotate else 0
+    turns = augmentation_rng.randrange(4) if rotate else 0
     if turns:
         rgb, target = np.rot90(rgb, turns).copy(), np.rot90(target, turns).copy()
         if map_kind == "normal":
@@ -207,7 +210,8 @@ def native_pair(sample: dict, size: int, rng: random.Random, map_kind: str,
     target_tensor = torch.from_numpy(target.transpose(2, 0, 1).copy())
     if exaggerate:
         target_tensor = exaggerate_depth(target_tensor)
-    return rgb_tensor, target_tensor, {"x": left, "y": top, "size": size, "quarter_turns": turns}
+    return rgb_tensor, target_tensor, {"x": left, "y": top, "size": size, "quarter_turns": turns,
+                                       "horizontal_flip": bool(horizontal_flip), "vertical_flip": bool(vertical_flip)}
 
 
 def classifier_pixels(path: str, width: int, height: int) -> Image.Image:

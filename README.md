@@ -6,11 +6,17 @@ Choose Texture Studio, then a folder containing diffuse images with matching dep
 
 Known diffuse/color and map filenames are recognized automatically. Bump maps never substitute for depth, unrecognized files never default to diffuse, and normal training uses OpenGL maps. Files marked ignored in Loom Factory stay out of Workshop training.
 
+Review flags and notes are informational. Training uses current files, dataset tags and matching map roles; it does not require manual review. Updating a review flag or note during a run does not change training membership.
+
 Texture Studio is checked in `/Applications` first. Choose its application bundle if it is installed elsewhere. That build must contain a complete Texture Loom package produced by Loom Factory; Workshop does not substitute another base model.
 
 Training settings, its Python environment, logs, and adapters stay under `.loom-workshop` in the chosen image folder. Image metadata preserves pair identity across renames. Changing the folder clears the active project; reopening a folder restores its settings. Original image pixels and the installed base weights are preserved.
 
-The image-order checkbox selects a fixed order or a new order each epoch. Crop positions remain random where the source has room. Random flipping applies to aligned pairs. **Exaggerate features** strengthens depth relief during training.
+The image-order checkbox selects a fixed order or a new order each epoch. Crop positions and flips/quarter-turn rotations have separate timing controls: every presentation, once per epoch, or once per run. Positions remain random where the source has room. Normal vectors transform with the paired image. **Exaggerate features** strengthens depth relief during training.
+
+Advanced options expose AdamW, Adam, SGD with momentum, and Lion; learning rate and constant/cosine scheduling with epoch warmup; batch size, gradient accumulation, clipping, decay and optimizer coefficients; LoRA rank and alpha; random seed and CPU/Apple GPU selection. The summary derives frozen-base and trainable-LoRA parameter counts from each installed model descriptor. Accumulated gradients are weighted by the actual number of pairs, including the final partial update. Lion generally needs a lower learning rate than AdamW.
+
+Checkpoint cadence saves LoRA deltas, optimizer state and sampling state under the run's `checkpoints` folder at epoch boundaries. Checkpoint files preserve intermediate work; a completed, validated adapter is still required for installation. Workshop does not currently expose checkpoint continuation or held-out early stopping.
 
 Build with Swift 6.2 on macOS 26 or later:
 

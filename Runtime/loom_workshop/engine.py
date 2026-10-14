@@ -23,6 +23,7 @@ from .lora import adapter_weights, attach_lora, frozen_base_weights, fuse_lora
 from .package import file_sha, load_base, resolve
 from .metadata import FACTORY_KEY, current_category, factory_category_id, membership_signature, prepare_membership, read_tag, stamp_category
 from .pixel_cache import DecodedImageCache
+from .training_options import accumulation_windows, learning_rate_at, make_optimizer, sampling_rng, validate_options
 
 
 class Cancelled(Exception):
@@ -58,6 +59,7 @@ def integer(request, field, default, low, high):
 def prepare(request):
     if request.get("schema") != "loom-workshop-training-v1":
         raise ValueError("Unsupported Loom Workshop request schema.")
+    validate_options(request)
     source = Path(os.path.abspath(os.path.expanduser(request["source_root"])))
     output = Path(os.path.abspath(os.path.expanduser(request["output_directory"])))
     if not source.is_dir() or not output.resolve().is_relative_to(source.resolve() / ".loom-workshop"):
@@ -291,9 +293,11 @@ def train(request, cancellation=None, plan_only=False):
         torch.mps.manual_seed(seed)
     rank, alpha = request.get("rank", 4), request.get("alpha", request.get("rank", 4))
     epochs, batch_size = request.get("epochs", 10), request.get("batch_size", 1)
-    order_rng, crop_rng = random.Random(seed), random.Random(seed + 1)
+    options = validate_options(request)
+    order_rng, crop_rng, augmentation_rng = random.Random(seed), random.Random(seed + 1), random.Random(seed + 2)
+    accumulation = options["gradient_accumulation_steps"]
     image_cache = DecodedImageCache(request.get("image_cache_megabytes", 256) * 1024 * 1024)
-    adapters, total_updates, update = {}, epochs * sum(math.ceil(len(group) / batch_size) for group in groups.values()), 0
+    adapters, total_updates, update = {}, epochs * sum(math.ceil(math.ceil(len(group) / batch_size) / accumulation) for group in groups.values()), 0
     emit("started", total_updates=total_updates, category_count=len({category for category, _ in groups}), device=device.type)
     try:
         for (category_id, map_kind), members in sorted(groups.items()):
@@ -303,43 +307,92 @@ def train(request, cancellation=None, plan_only=False):
             targets = attach_lora(model, rank, alpha)
             before = frozen_base_weights(model)
             model.to(device)
-            optimizer = torch.optim.AdamW([parameter for parameter in model.parameters() if parameter.requires_grad], lr=request.get("learning_rate", 0.001))
+            trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+            optimizer = make_optimizer(trainable, request.get("learning_rate", 0.001), options)
+            base_parameters = sum(value.numel() for value in before.values())
+            trainable_parameters = sum(value.numel() for value in trainable)
+            steps_per_epoch = math.ceil(math.ceil(len(members) / batch_size) / accumulation)
+            group_total_steps, group_update = epochs * steps_per_epoch, 0
+            emit("model", category_id=category_id, map=map_kind, base_parameters=base_parameters,
+                 trainable_parameters=trainable_parameters, optimizer=options["optimizer"],
+                 effective_batch_size=batch_size * accumulation, total_updates=group_total_steps,
+                 message=f"{category['name']} {map_kind}: {trainable_parameters:,} trainable LoRA parameters")
             losses = []
             for epoch in range(epochs):
                 order = list(range(len(members)))
                 if request.get("shuffle_each_epoch", True):
                     order_rng.shuffle(order)
-                for start in range(0, len(order), batch_size):
-                    cancellation.check()
-                    selected = [members[index] for index in order[start:start + batch_size]]
-                    paths = {sample[field] for sample in selected for field in ("input", "target")}
-                    check_current_membership(paths, signatures, identities, fingerprints)
-                    check_pair_selection(category_id, map_kind, selected, manifest)
-                    pairs = [native_pair(sample, image_size, crop_rng, map_kind, request.get("flip_crops", True),
-                        request.get("rotate_crops", False), map_kind == "depth" and request.get("exaggerate_features", False),
-                        cache=image_cache) for sample in selected]
-                    rgb = torch.stack([pair[0] for pair in pairs]).to(device)
-                    target = torch.stack([pair[1] for pair in pairs]).to(device)
+                for window, window_samples in accumulation_windows(order, batch_size, accumulation):
                     optimizer.zero_grad(set_to_none=True)
-                    prediction = model(rgb)
-                    if map_kind == "normal":
-                        loss = (1 - (F.normalize(prediction * 2 - 1, dim=1, eps=1e-6) * F.normalize(target * 2 - 1, dim=1, eps=1e-6)).sum(dim=1)).mean()
-                    else:
-                        loss = F.l1_loss(prediction, target)
-                    loss.backward()
-                    norm = torch.nn.utils.clip_grad_norm_([parameter for parameter in model.parameters() if parameter.requires_grad], 1.0)
-                    loss_number, gradient_number = torch.stack((loss.detach(), norm.detach())).cpu().tolist()
+                    window_loss = torch.zeros((), device=device)
+                    for indices in window:
+                        cancellation.check()
+                        selected = [members[index] for index in indices]
+                        paths = {sample[field] for sample in selected for field in ("input", "target")}
+                        check_current_membership(paths, signatures, identities, fingerprints)
+                        check_pair_selection(category_id, map_kind, selected, manifest)
+                        pairs = [native_pair(sample, image_size,
+                            sampling_rng(options["crop_refresh"], seed, "crop", sample["id"], epoch, crop_rng),
+                            map_kind, request.get("flip_crops", True), request.get("rotate_crops", False),
+                            map_kind == "depth" and request.get("exaggerate_features", False), cache=image_cache,
+                            augmentation_rng=sampling_rng(options["augmentation_refresh"], seed, "augmentation",
+                                sample["id"], epoch, augmentation_rng)) for sample in selected]
+                        rgb = torch.stack([pair[0] for pair in pairs]).to(device)
+                        target = torch.stack([pair[1] for pair in pairs]).to(device)
+                        prediction = model(rgb)
+                        if map_kind == "normal":
+                            loss = (1 - (F.normalize(prediction * 2 - 1, dim=1, eps=1e-6) * F.normalize(target * 2 - 1, dim=1, eps=1e-6)).sum(dim=1)).mean()
+                        else:
+                            loss = F.l1_loss(prediction, target)
+                        weight = len(indices) / window_samples
+                        (loss * weight).backward()
+                        window_loss.add_(loss.detach(), alpha=weight)
+                        del rgb, target, prediction, loss, pairs
+                    cancellation.check()
+                    clip = options["gradient_clip_norm"]
+                    norm = torch.nn.utils.clip_grad_norm_(trainable, clip if clip > 0 else float("inf"))
+                    loss_number, gradient_number = torch.stack((window_loss, norm.detach())).cpu().tolist()
                     if not math.isfinite(loss_number):
                         raise ValueError("LoRA training produced a non-finite loss; no adapter was published.")
                     if not math.isfinite(gradient_number):
                         raise ValueError("LoRA gradients became non-finite; no adapter was published.")
+                    learning_rate = learning_rate_at(group_update, group_total_steps, steps_per_epoch,
+                        request.get("learning_rate", 0.001), options)
+                    for parameter_group in optimizer.param_groups:
+                        parameter_group["lr"] = learning_rate
                     optimizer.step()
                     update += 1
+                    group_update += 1
                     losses.append(loss_number)
                     emit("progress", update=update, total_updates=total_updates, progress=update / total_updates,
-                         epoch=epoch + 1, loss=losses[-1], category_id=category_id, map=map_kind,
-                         message=f"{category['name']} · {map_kind} · epoch {epoch + 1} of {epochs}")
-                    del rgb, target, prediction, loss, pairs
+                         epoch=epoch + 1, loss=loss_number, learning_rate=learning_rate,
+                         gradient_norm=gradient_number, effective_batch_samples=window_samples,
+                         category_id=category_id, map=map_kind,
+                         message=f"{category['name']} · {map_kind} · epoch {epoch + 1} of {epochs} · update {group_update}")
+                if (epoch + 1) % options["checkpoint_every_epochs"] == 0 or epoch + 1 == epochs:
+                    cancellation.check()
+                    checkpoint_folder = output / "checkpoints" / ("dataset-" + __import__("hashlib").sha256(category_id.encode()).hexdigest()[:16]) / map_kind
+                    checkpoint_folder.mkdir(parents=True, exist_ok=True)
+                    checkpoint = checkpoint_folder / f"epoch-{epoch + 1:06d}"
+                    delta = adapter_weights(model)
+                    if not all(torch.isfinite(value).all() for value in delta.values()):
+                        raise ValueError("LoRA weights contain non-finite values; checkpoint was not saved.")
+                    save_file(delta, str(checkpoint.with_suffix(".safetensors")), metadata={"rank": str(rank), "alpha": str(alpha)})
+                    state_path = checkpoint.with_suffix(".state.pt")
+                    temporary_state = state_path.with_suffix(".tmp")
+                    torch.save({"schema": "loom-workshop-checkpoint-v1", "optimizer": optimizer.state_dict(),
+                        "epoch": epoch + 1, "updates": group_update, "base_sha256": file_sha(base_weights_path),
+                        "options": options, "rank": rank, "alpha": alpha,
+                        "order_rng": order_rng.getstate(), "crop_rng": crop_rng.getstate(),
+                        "augmentation_rng": augmentation_rng.getstate(), "torch_rng": torch.get_rng_state()}, temporary_state)
+                    temporary_state.replace(state_path)
+                    write_json(checkpoint.with_suffix(".json"), {"schema": "loom-workshop-checkpoint-v1",
+                        "base_id": manifest["id"], "base_version": manifest["version"], "category_id": category_id,
+                        "map": map_kind, "epoch": epoch + 1, "updates": group_update,
+                        "base_sha256": file_sha(base_weights_path), "final_loss": losses[-1],
+                        "weights_path": checkpoint.with_suffix(".safetensors").name, "state_path": state_path.name})
+                    emit("checkpoint", epoch=epoch + 1, category_id=category_id, map=map_kind,
+                        message=f"Saved {category['name']} {map_kind} LoRA checkpoint for epoch {epoch + 1}")
             after = frozen_base_weights(model)
             if any(not torch.equal(before[key], after[key]) for key in before):
                 raise ValueError("Frozen base weights changed; adapter export was stopped.")
@@ -368,6 +421,8 @@ def train(request, cancellation=None, plan_only=False):
                 "architecture_config": fused.descriptor(), "epochs": epochs, "updates": len(losses), "final_loss": losses[-1],
                 "base_weights_frozen": True, "coreml_maximum_absolute_difference": float(np.max(np.abs(actual - expected))),
                 "decoded_image_cache": image_cache.statistics(),
+                "training_options": options, "batch_size": batch_size, "learning_rate": request.get("learning_rate", 0.001),
+                "base_parameters": base_parameters, "trainable_parameters": trainable_parameters,
                 "quality_note": "Adapter completion does not measure prediction quality on unseen materials."})
             emit("status", message=f"{category['name']} {map_kind} LoRA exported and checked.")
             del model, optimizer, fused

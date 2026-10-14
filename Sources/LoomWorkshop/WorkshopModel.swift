@@ -38,10 +38,13 @@ final class WorkshopModel {
     var selectedDatasetIDs: [String] {
         selectedDatasetID.isEmpty ? availableDatasets.map(\.id) : [selectedDatasetID]
     }
+    var trainingOptionsIssue: String? {
+        do { try options.validate(); return nil }
+        catch { return error.localizedDescription }
+    }
     var canTrain: Bool {
         studio != nil && plan != nil && !busy && plan?.requiresClassification == false &&
-        plan?.options.imageSize == options.imageSize && options.epochs > 0 &&
-        options.rank > 0 && options.rank <= 128 && options.learningRate.isFinite && options.learningRate > 0 &&
+        plan?.options.imageSize == options.imageSize && trainingOptionsIssue == nil &&
         !selectedDatasetIDs.isEmpty && (selectedDatasetID.isEmpty || availableDatasets.contains { $0.id == selectedDatasetID }) &&
         !options.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }

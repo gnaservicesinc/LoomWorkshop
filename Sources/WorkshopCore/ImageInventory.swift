@@ -27,7 +27,6 @@ private struct FactoryTag: Decodable {
     let pairingKey: String
     let role: String
     let category: String?
-    let verified: Bool
     let normalConvention: String?
     let ignored: Bool?
 }
@@ -62,7 +61,7 @@ private func filenameRole(_ file: URL, legacy: Bool = false) -> (String, String,
     var stem = file.deletingPathExtension().lastPathComponent.lowercased()
         .replacingOccurrences(of: "-", with: "_").replacingOccurrences(of: " ", with: "_")
     let diffusePattern = legacy ? "(?:^|_)(?:diff|diffuse|albedo|basecolor|color|col)(?=_|$)"
-        : "(?:^|_)(?:diff|diffuse|albedo|base_?(?:color|colour|col|colo)|color|colour|col|colo)(?=_|$)"
+        : "(?:^|_)(?:diff|diffuse|albedo|base_?(?:color|colour|col|colo)|color|colour|col_?1|coll_?1|col|colo)(?=_|$)"
     let normalPattern = legacy ? "(?:^|_)(?:nor|normal)(?=_|$)" : "(?:^|_)(?:nor|normal|normalgl)(?=_|$)"
     var replacements: [(String, String, String)] = [
         ("(?:^|_)(?:nor|normal)_(?:dx|directx)(?=_|$)", "normal", "directx"),
@@ -160,7 +159,7 @@ func currentSamples(source: URL, studio: StudioBase, imageSize: Int) throws -> [
         var currentFactoryCategory: String?
         if let bytes = metadataBytes(file, key: "com.gnaservicesinc.loomfactory.image.v1") {
             guard let factory = try? JSONDecoder().decode(FactoryTag.self, from: bytes) else {
-                throw WorkshopError("Loom Factory metadata could not be read for \(file.lastPathComponent). Review this file in Loom Factory before training.")
+                throw WorkshopError("Loom Factory metadata could not be read for \(file.lastPathComponent). Check this file's metadata in Loom Factory.")
             }
             if factory.ignored == true { continue }
             tag.pairID = factory.pairingKey

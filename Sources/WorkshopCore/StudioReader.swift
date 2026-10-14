@@ -107,6 +107,22 @@ func readStudio(_ application: URL) throws -> (StudioBase, BaseManifest) {
             }
         } else { throw WorkshopError("Texture Studio's classifier requires an image or RGB tensor input.") }
     }
-    let datasets = manifest.categories.map { BaseDataset(id: $0.id, name: $0.name, version: $0.version, mapKinds: $0.models.map(\.map)) }
+    let datasets = manifest.categories.map { category in
+        let profiles = category.models.compactMap { model -> BaseModelProfile? in
+            let parent = (model.weightsPath as NSString).deletingLastPathComponent
+            let relative = parent.isEmpty ? "model.json" : parent + "/model.json"
+            guard model.architecture == "loom-factory-material-residual-v1",
+                  let path = try? modelPath(relative, in: root), inventory.contains(relative),
+                  let data = try? Data(contentsOf: path),
+                  let descriptor = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let config = (descriptor["architecture_config"] ?? descriptor["architecture"]) as? [String: Any],
+                  config["id"] as? String == "loom-factory-material-residual-v1",
+                  let width = config["width"] as? Int, let blocks = config["blocks"] as? Int,
+                  (4...512).contains(width), (1...64).contains(blocks) else { return nil }
+            return BaseModelProfile(map: model.map, width: width, blocks: blocks)
+        }
+        return BaseDataset(id: category.id, name: category.name, version: category.version,
+            mapKinds: category.models.map(\.map), modelProfiles: profiles)
+    }
     return (StudioBase(applicationURL: app, modelID: manifest.id, modelName: manifest.name, version: manifest.version, categories: datasets, packageURL: root), manifest)
 }

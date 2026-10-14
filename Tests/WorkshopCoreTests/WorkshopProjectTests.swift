@@ -54,7 +54,7 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(afterRemoval.imageCount, 0); XCTAssertTrue(afterRemoval.datasets.isEmpty)
     }
 
-    func testReviewedFactoryMetadataDefinesPairingAndCategory() async throws {
+    func testFactoryMetadataDefinesPairingAndCategory() async throws {
         let studio = try makeStudio(), source = try folder("Source")
         let diffuse = source.appendingPathComponent("renamed-one.png"), depth = source.appendingPathComponent("renamed-two.png")
         try image(diffuse); try image(depth)
@@ -76,6 +76,26 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         try writeTag(inferred, to: diffuse)
         let classifiedAgain = try await project.snapshot(imageSize: 32)
         XCTAssertFalse(classifiedAgain.requiresClassification)
+    }
+
+    func testReviewFlagsAreOptionalAndNeverDetermineCurrentPairSelection() async throws {
+        let studio = try makeStudio(), source = try folder("Optional Review Metadata")
+        let diffuse = source.appendingPathComponent("brick_diff.png"), depth = source.appendingPathComponent("brick_disp.png")
+        try image(diffuse); try image(depth)
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        for verified in [nil, false, true, false] as [Bool?] {
+            for (file, role) in [(diffuse, "diffuse"), (depth, "depth")] {
+                var tag: [String: Any] = ["id": role, "pairingKey": "material-pair", "role": role,
+                    "category": "Bricks", "normalConvention": "opengl"]
+                if let verified { tag["verified"] = verified; tag["note"] = "Optional note" }
+                let data = try JSONSerialization.data(withJSONObject: tag)
+                XCTAssertEqual(data.withUnsafeBytes { setxattr(file.path, "com.gnaservicesinc.loomfactory.image.v1", $0.baseAddress, data.count, 0, 0) }, 0)
+            }
+            let snapshot = try await project.snapshot(imageSize: 32)
+            XCTAssertFalse(snapshot.requiresClassification)
+            XCTAssertEqual(snapshot.imageCount, 1)
+            XCTAssertEqual(snapshot.datasets.first?.pairedCounts["depth"], 1)
+        }
     }
 
     func testTrainingDimensionsNeverUpscaleSmallSources() async throws {
@@ -161,7 +181,7 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
 
     func testDiffuseNameAliasesMatchTargetsAndMaterialNameCannotOverrideBump() async throws {
         let studio = try makeStudio()
-        for alias in ["diff", "color", "colour", "basecolor", "basecolour", "base_color", "base_colour", "base_col", "base_colo"] {
+        for alias in ["diff", "color", "colour", "basecolor", "basecolour", "base_color", "base_colour", "base_col", "base_colo", "col1", "coll1", "col_1", "coll_1"] {
             let source = try folder("Alias " + alias)
             let diffuse = source.appendingPathComponent("brick_\(alias)_1k.png"), depth = source.appendingPathComponent("brick_disp_1k.png")
             try image(diffuse); try image(depth)

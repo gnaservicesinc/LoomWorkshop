@@ -4,6 +4,7 @@ import WorkshopCore
 struct WorkshopView: View {
     @Bindable var model: WorkshopModel
     var startsAutomatically = true
+    var showsAdvancedOptionsInitially = false
     @State private var advancedOptions = false
 
     var body: some View {
@@ -38,6 +39,7 @@ struct WorkshopView: View {
                 await model.pollFolder()
             }
         }
+        .onAppear { if showsAdvancedOptionsInitially { advancedOptions = true } }
         .onChange(of: model.options) { _, _ in model.scheduleOptionsSave() }
         .onChange(of: model.selectedDatasetID) { _, _ in model.scheduleOptionsSave() }
         .alert("Action could not finish", isPresented: Binding(
@@ -179,13 +181,34 @@ struct WorkshopView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Toggle("Randomize image order each epoch", isOn: $model.options.shuffleEachEpoch)
                 Toggle("Randomly flip crops", isOn: $model.options.flipCrops)
+                Toggle("Randomly rotate crops by quarter turns", isOn: $model.options.rotateCrops)
+                HStack {
+                    Text("Choose crop positions").foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("Choose crop positions", selection: $model.options.cropRefresh) {
+                        ForEach(WorkshopRefresh.allCases) { Text($0.title).tag($0) }
+                    }.labelsHidden().frame(width: 200)
+                }
+                HStack {
+                    Text("Choose flips and rotations").foregroundStyle(.secondary)
+                    Spacer()
+                    Picker("Choose flips and rotations", selection: $model.options.augmentationRefresh) {
+                        ForEach(WorkshopRefresh.allCases) { Text($0.title).tag($0) }
+                    }.labelsHidden().frame(width: 200)
+                }.disabled(!model.options.flipCrops && !model.options.rotateCrops)
                 Toggle("Exaggerate features", isOn: $model.options.exaggerateFeatures)
                     .disabled(!hasDepthPairs)
-                Text("Exaggerate features strengthens depth relief. Crop positions vary wherever the image has room.")
+                Text("Flips use independent 50% chances horizontally and vertically. Crop positions vary wherever the image has room. Exaggerate features strengthens depth relief.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }.toggleStyle(.checkbox)
             DisclosureGroup("Advanced options", isExpanded: $advancedOptions) {
                 Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 12) {
+                    GridRow {
+                        Text("Optimizer").foregroundStyle(.secondary)
+                        Picker("Optimizer", selection: $model.options.optimizer) {
+                            ForEach(WorkshopOptimizer.allCases) { Text($0.title).tag($0) }
+                        }.labelsHidden().frame(maxWidth: 180).accessibilityIdentifier("optimizer-picker")
+                    }
                     GridRow {
                         Text("Learning rate").foregroundStyle(.secondary)
                         TextField("Learning rate", value: $model.options.learningRate,
@@ -195,14 +218,94 @@ struct WorkshopView: View {
                     GridRow {
                         Text("LoRA rank").foregroundStyle(.secondary)
                         Picker("LoRA rank", selection: $model.options.rank) {
-                            ForEach([2, 4, 8, 16, 32], id: \.self) { rank in Text(rank, format: .number).tag(rank) }
+                            ForEach([1, 2, 4, 8, 16, 32, 64, 128], id: \.self) { rank in Text(rank, format: .number).tag(rank) }
                         }.labelsHidden().frame(maxWidth: 180)
                     }
+                    GridRow {
+                        Text("LoRA alpha").foregroundStyle(.secondary)
+                        HStack { decimalField($model.options.alpha); Text("Scale = alpha ÷ rank").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    GridRow {
+                        Text("Batch size").foregroundStyle(.secondary)
+                        Stepper(value: $model.options.batchSize, in: 1...256) {
+                            Text("\(model.options.batchSize) \(model.options.batchSize == 1 ? "pair" : "pairs") at once")
+                        }.accessibilityIdentifier("batch-size")
+                    }
+                    GridRow {
+                        Text("Gradient accumulation").foregroundStyle(.secondary)
+                        Stepper(value: $model.options.gradientAccumulationSteps, in: 1...4096) {
+                            Text("\(model.options.gradientAccumulationSteps) batches per update")
+                        }.accessibilityIdentifier("gradient-accumulation")
+                    }
+                    GridRow {
+                        Text("Effective batch").foregroundStyle(.secondary)
+                        Text("Up to \(model.options.effectiveBatchSize) pairs per update").font(.callout)
+                    }
+                    GridRow {
+                        Text("Weight decay").foregroundStyle(.secondary)
+                        decimalField($model.options.weightDecay)
+                    }
+                    if model.options.optimizer == .sgd {
+                        GridRow {
+                            Text("Momentum").foregroundStyle(.secondary)
+                            decimalField($model.options.momentum)
+                        }
+                    } else {
+                        GridRow {
+                            Text("Beta 1 / Beta 2").foregroundStyle(.secondary)
+                            HStack { decimalField($model.options.beta1); decimalField($model.options.beta2) }
+                        }
+                    }
+                    GridRow {
+                        Text("Gradient clip norm").foregroundStyle(.secondary)
+                        HStack { decimalField($model.options.maxGradientNorm); Text("0 disables clipping").font(.caption).foregroundStyle(.secondary) }
+                    }
+                    GridRow {
+                        Text("Learning rate schedule").foregroundStyle(.secondary)
+                        Picker("Learning rate schedule", selection: $model.options.learningRateSchedule) {
+                            ForEach(WorkshopSchedule.allCases) { Text($0.title).tag($0) }
+                        }.labelsHidden().frame(maxWidth: 180)
+                    }
+                    GridRow {
+                        Text("Warmup epochs").foregroundStyle(.secondary)
+                        Stepper(value: $model.options.warmupEpochs, in: 0...(max(1, model.options.epochs) - 1)) {
+                            Text(model.options.warmupEpochs, format: .number)
+                        }
+                    }
+                    if model.options.learningRateSchedule == .cosine {
+                        GridRow {
+                            Text("Final learning rate ratio").foregroundStyle(.secondary)
+                            decimalField($model.options.minimumLearningRateRatio)
+                        }
+                    }
+                    GridRow {
+                        Text("Random seed").foregroundStyle(.secondary)
+                        TextField("Random seed", value: $model.options.seed, format: .number.grouping(.never))
+                            .textFieldStyle(.roundedBorder).frame(maxWidth: 180)
+                    }
+                    GridRow {
+                        Text("Training device").foregroundStyle(.secondary)
+                        Picker("Training device", selection: $model.options.device) {
+                            ForEach(WorkshopDevice.allCases) { Text($0.title).tag($0) }
+                        }.labelsHidden().frame(maxWidth: 180)
+                    }
+                    GridRow {
+                        Text("Save checkpoint every").foregroundStyle(.secondary)
+                        Stepper(value: $model.options.checkpointEveryEpochs, in: 1...100_000) {
+                            Text("\(model.options.checkpointEveryEpochs) epochs")
+                        }
+                    }
                 }.padding(.top, 12)
+                Text(model.options.optimizer == .lion ? "Lion usually needs a lower learning rate than AdamW. Start with 0.00003 and betas 0.9 / 0.99, then adjust from your results." : "Accumulation increases the effective batch while keeping only one batch in memory. The last update of each epoch uses the remaining pairs.")
+                    .font(.callout).foregroundStyle(.secondary).padding(.top, 10)
             }
             if let plan = model.plan, !plan.requiresClassification, model.availableDatasets.isEmpty {
                 Label("No matching map pairs at this image size. Check the matching files or choose a smaller size.", systemImage: "info.circle")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if let issue = model.trainingOptionsIssue {
+                Label(issue, systemImage: "info.circle").font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Text("Training files and results stay in this image folder.")
                 .font(.callout).foregroundStyle(.secondary)
@@ -221,6 +324,12 @@ struct WorkshopView: View {
                     Text("Matching diffuse and target maps appear here after your folder is read.")
                         .font(.callout).foregroundStyle(.secondary)
                 } else {
+                    Text("\(model.options.optimizer.title) · up to \(model.options.effectiveBatchSize) pairs per update")
+                        .font(.callout).foregroundStyle(.secondary)
+                    if model.trainingOptionsIssue == nil {
+                        Text("\(plannedUpdates.formatted()) optimizer updates over \(model.options.epochs) epochs")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     ForEach(selectedDatasets) { dataset in
                         VStack(alignment: .leading, spacing: 8) {
                             Text(dataset.name).font(.body.weight(.semibold))
@@ -231,6 +340,10 @@ struct WorkshopView: View {
                                         Spacer()
                                         Text("\(count) \(count == 1 ? "pair" : "pairs")").monospacedDigit()
                                     }.font(.callout)
+                                    if (1...128).contains(model.options.rank), let profile = model.studio?.categories.first(where: { $0.id == dataset.id })?.modelProfiles?.first(where: { $0.map == kind }) {
+                                        Text("\(profile.baseParameters.formatted()) frozen base · \(profile.trainableParameters(rank: model.options.rank).formatted()) trainable LoRA parameters")
+                                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                    }
                                 }
                             }
                         }
@@ -286,7 +399,9 @@ struct WorkshopView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(model.status.isEmpty ? "Ready when you are" : model.status).font(.callout).lineLimit(2)
                     if let event = model.events.last, let epoch = event.epoch {
-                        Text("Epoch \(epoch)" + (event.loss.map { " · Loss \($0.formatted(.number.precision(.fractionLength(5))))" } ?? ""))
+                        Text("Epoch \(epoch)" + (event.update.map { " · Update \($0)/\(event.totalUpdates ?? $0)" } ?? "") +
+                             (event.loss.map { " · Loss \($0.formatted(.number.precision(.fractionLength(5))))" } ?? "") +
+                             (event.learningRate.map { " · LR \($0.formatted(.number.precision(.fractionLength(1...7))))" } ?? ""))
                             .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                     }
                 }
@@ -307,6 +422,18 @@ struct WorkshopView: View {
 
     private var selectedDatasets: [WorkshopDataset] {
         model.availableDatasets.filter { model.selectedDatasetID.isEmpty || $0.id == model.selectedDatasetID }
+    }
+    private var plannedUpdates: Int {
+        let effective = max(1, model.options.effectiveBatchSize)
+        return selectedDatasets.reduce(0) { total, dataset in
+            total + dataset.pairedCounts.values.reduce(0) { result, count in
+                result + (count / effective + (count % effective == 0 ? 0 : 1)) * model.options.epochs
+            }
+        }
+    }
+    private func decimalField(_ value: Binding<Double>) -> some View {
+        TextField("Value", value: value, format: .number.precision(.fractionLength(0...7)))
+            .textFieldStyle(.roundedBorder).frame(maxWidth: 180)
     }
     private var hasDepthPairs: Bool { selectedDatasets.contains { ($0.pairedCounts["depth"] ?? 0) > 0 } }
     private func mapTitle(_ kind: String) -> String {

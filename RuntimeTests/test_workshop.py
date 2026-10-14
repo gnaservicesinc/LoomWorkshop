@@ -17,7 +17,26 @@ from loom_workshop.base_models import MaterialMapNetwork
 from loom_workshop.engine import Cancellation, Cancelled, train
 from loom_workshop.lora import adapter_weights, attach_lora, frozen_base_weights, fuse_lora
 from loom_workshop.package import file_sha, load_base
-from loom_workshop.metadata import FACTORY_KEY, WORKSHOP_KEY, read_tag, write_tag, set_raw_tag, prepare_membership
+from loom_workshop.metadata import FACTORY_KEY, WORKSHOP_KEY, read_tag, write_tag, set_raw_tag, prepare_membership, membership_signature
+
+
+class ReviewMetadataTests(unittest.TestCase):
+    def test_review_flags_and_notes_do_not_change_membership_signature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "diffuse.png"
+            image.write_bytes(b"original image bytes")
+            factory = {"id": "source", "pairingKey": "pair", "role": "diffuse", "category": "Bark"}
+            set_raw_tag(image, FACTORY_KEY, json.dumps(factory).encode())
+            write_tag(image, {"id": "source", "pairID": "pair", "role": "diffuse"})
+            original = membership_signature(image)
+            for verified in (False, True, False):
+                set_raw_tag(image, FACTORY_KEY, json.dumps({**factory, "verified": verified, "note": "optional note"}).encode())
+                workshop = read_tag(image, WORKSHOP_KEY)
+                write_tag(image, {**workshop, "verified": verified, "note": "optional Workshop note"})
+                self.assertEqual(membership_signature(image), original)
+            set_raw_tag(image, FACTORY_KEY, json.dumps({**factory, "category": "Wood"}).encode())
+            self.assertNotEqual(membership_signature(image), original)
+            self.assertEqual(image.read_bytes(), b"original image bytes")
 
 
 class BumpMembershipTests(unittest.TestCase):
@@ -223,6 +242,55 @@ class InstalledBaseTrainingTests(unittest.TestCase):
             self.assertEqual(json.loads((Path(request["output_directory"]) / "result.json").read_text())["status"], "completed")
 
     @unittest.skipUnless(archive.is_file(), "Requires a genuine Factory integration export fixture")
+    def test_advanced_options_drive_real_partial_updates_sampling_and_checkpoints(self):
+        from unittest.mock import patch
+        from loom_workshop.images import native_pair
+        with tempfile.TemporaryDirectory() as directory:
+            request, _, _ = self.fixture(Path(directory))
+            source = Path(request["source_root"])
+            original = request["samples"][0]
+            samples = []
+            for index in range(5):
+                diffuse, depth = source / f"brick-{index}-diffuse.png", source / f"brick-{index}-depth.png"
+                diffuse.write_bytes(Path(original["input"]).read_bytes())
+                depth.write_bytes(Path(original["targets"]["depth"]).read_bytes())
+                samples.append({"id": f"brick-{index}", "input": str(diffuse), "targets": {"depth": str(depth)}})
+            request.update(samples=samples, epochs=3, batch_size=2, gradient_accumulation_steps=2,
+                           optimizer="sgd", momentum=0.5, weight_decay=0.02, gradient_clip_norm=0,
+                           lr_schedule="cosine", warmup_epochs=1, minimum_lr_ratio=0.2,
+                           crop_refresh="per_run", augmentation_refresh="per_epoch",
+                           flip_crops=True, rotate_crops=True)
+            plans = {}
+            def record(sample, *args, **kwargs):
+                result = native_pair(sample, *args, **kwargs)
+                plans.setdefault(sample["id"], []).append(result[2])
+                return result
+            with contextlib.redirect_stdout(io.StringIO()) as log, patch("loom_workshop.engine.native_pair", record):
+                adapter = train(request)
+            events = [json.loads(line) for line in log.getvalue().splitlines() if line.startswith("{")]
+            updates = [event for event in events if event["event"] == "progress"]
+            self.assertEqual(len(updates), 6)
+            self.assertEqual([event["effective_batch_samples"] for event in updates], [4, 1, 4, 1, 4, 1])
+            self.assertAlmostEqual(updates[0]["learning_rate"], 0.005)
+            self.assertAlmostEqual(updates[-1]["learning_rate"], 0.002)
+            for seen in plans.values():
+                self.assertEqual(len(seen), 3)
+                self.assertEqual(len({(plan["x"], plan["y"]) for plan in seen}), 1)
+            output = Path(request["output_directory"])
+            checkpoints = list((output / "checkpoints").rglob("*.json"))
+            self.assertEqual(len(checkpoints), 3)
+            final_checkpoint = json.loads(sorted(checkpoints)[-1].read_text())
+            self.assertEqual(final_checkpoint["updates"], 6)
+            self.assertEqual(final_checkpoint["epoch"], 3)
+            checkpoint_weights = load_file(str(sorted(checkpoints)[-1].with_suffix(".safetensors")))
+            self.assertTrue(checkpoint_weights)
+            descriptor = output / "adapter" / Path(adapter["categories"][0]["adapters"][0]["weightsPath"]).parent / "adapter.json"
+            metadata = json.loads(descriptor.read_text())
+            self.assertEqual(metadata["training_options"]["optimizer"], "sgd")
+            self.assertEqual(metadata["updates"], 6)
+            self.assertGreater(metadata["trainable_parameters"], 0)
+
+    @unittest.skipUnless(archive.is_file(), "Requires a genuine Factory integration export fixture")
     def test_photos_without_targets_are_sorted_but_cannot_fake_learning(self):
         with tempfile.TemporaryDirectory() as directory:
             request, _, _ = self.fixture(Path(directory))
@@ -262,6 +330,26 @@ class InstalledBaseTrainingTests(unittest.TestCase):
             self.assertEqual(json.loads((output / "result.json").read_text())["status"], "cancelled")
 
     @unittest.skipUnless(archive.is_file(), "Requires a genuine Factory integration export fixture")
+    def test_cancellation_preserves_completed_epoch_checkpoint(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            request, _, _ = self.fixture(Path(directory))
+            request["epochs"] = 3
+            cancellation = Cancellation()
+            def stop_after_checkpoint(event, **fields):
+                if event == "checkpoint":
+                    cancellation.requested = True
+            with patch("loom_workshop.engine.emit", stop_after_checkpoint), self.assertRaises(Cancelled):
+                train(request, cancellation)
+            output = Path(request["output_directory"])
+            checkpoints = list((output / "checkpoints").rglob("*.json"))
+            self.assertEqual(len(checkpoints), 1)
+            self.assertEqual(json.loads(checkpoints[0].read_text())["epoch"], 1)
+            self.assertTrue(load_file(str(checkpoints[0].with_suffix(".safetensors"))))
+            self.assertTrue(checkpoints[0].with_suffix(".state.pt").is_file())
+            self.assertFalse((output / "adapter" / "manifest.json").exists())
+
+    @unittest.skipUnless(archive.is_file(), "Requires a genuine Factory integration export fixture")
     def test_non_finite_loss_cannot_publish_an_adapter(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
@@ -294,7 +382,7 @@ class InstalledBaseTrainingTests(unittest.TestCase):
             self.assertEqual(list(plan["groups"]), [(tag["categoryID"], "depth")])
 
     @unittest.skipUnless(archive.is_file(), "Requires a genuine Factory integration export fixture")
-    def test_reviewed_factory_tag_is_honored_and_stale_request_is_rejected(self):
+    def test_current_factory_tag_is_honored_and_stale_request_is_rejected(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
             request, manifest, _ = self.fixture(Path(directory))
@@ -304,11 +392,39 @@ class InstalledBaseTrainingTests(unittest.TestCase):
                 set_raw_tag(path, FACTORY_KEY, json.dumps({"id": "factory-" + role, "pairingKey": "factory-pair", "role": role,
                     "category": category["name"], "verified": True, "note": "reviewed"}).encode())
             sample["category_id"] = category["id"]
-            with contextlib.redirect_stdout(io.StringIO()), patch("loom_workshop.engine.classifier_model", side_effect=AssertionError("A reviewed Factory tag must be honored")):
+            with contextlib.redirect_stdout(io.StringIO()), patch("loom_workshop.engine.classifier_model", side_effect=AssertionError("A current Factory tag must be honored")):
                 train(request, plan_only=True)
             sample["category_id"] = "dataset-stale"
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "tag changed"):
                 train(request, plan_only=True)
+
+    @unittest.skipUnless(archive.is_file(), "Requires a genuine Factory integration export fixture")
+    def test_changing_optional_review_during_epochs_does_not_stop_real_lora_training(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            request, manifest, _ = self.fixture(Path(directory))
+            request["epochs"] = 3
+            sample = request["samples"][0]
+            category = manifest["categories"][0]
+            paths = [(sample["input"], "diffuse"), (sample["targets"]["depth"], "depth")]
+            for path, role in paths:
+                set_raw_tag(path, FACTORY_KEY, json.dumps({"id": "factory-" + role, "pairingKey": "factory-pair",
+                    "role": role, "category": category["name"], "verified": False}).encode())
+            sample["category_id"] = category["id"]
+            updates = []
+            def change_review(event, **fields):
+                if event == "progress":
+                    updates.append(fields["update"])
+                    for path, _ in paths:
+                        tag = read_tag(path, FACTORY_KEY)
+                        set_raw_tag(path, FACTORY_KEY, json.dumps({**tag, "verified": not tag["verified"],
+                            "note": f"Optional note after update {fields['update']}"}).encode())
+            with contextlib.redirect_stdout(io.StringIO()), patch("loom_workshop.engine.emit", change_review):
+                adapter = train(request)
+            self.assertEqual(updates, [1, 2, 3])
+            self.assertEqual(adapter["schema"], "texture-loom.adapter.v1")
+            output = Path(request["output_directory"])
+            self.assertEqual(json.loads((output / "result.json").read_text())["status"], "completed")
 
     @unittest.skipUnless(archive.is_file(), "Requires a genuine Factory integration export fixture")
     def test_changed_pair_metadata_halts_export(self):

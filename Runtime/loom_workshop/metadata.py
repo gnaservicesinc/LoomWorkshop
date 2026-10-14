@@ -151,14 +151,14 @@ def stamp_category(path, category_id, manifest):
 
 
 def membership_signature(path):
-    """Only data-selection fields; changing a review note does not alter membership."""
+    """Only data-selection fields; review flags and notes do not alter membership."""
     result = []
     for key in (FACTORY_KEY, WORKSHOP_KEY):
         tag = read_tag(path, key)
         if tag is None:
             result.append(None)
         elif key == FACTORY_KEY:
-            result.append({name: tag.get(name) for name in ("id", "pairingKey", "role", "category", "verified", "normalConvention", "ignored")})
+            result.append({name: tag.get(name) for name in ("id", "pairingKey", "role", "category", "normalConvention", "ignored")})
         else:
             result.append({name: tag.get(name) for name in ("id", "pairID", "role", "categoryID", "baseID", "baseVersion", "classifiedBytes", "classifiedModified", "factoryCategory", "normalConvention")})
     return result
