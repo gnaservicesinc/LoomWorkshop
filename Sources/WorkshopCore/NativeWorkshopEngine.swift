@@ -99,7 +99,7 @@ struct NativeWorkshopEngine: Sendable {
                 try cancellation.check()
                 let members = groups[key]!
                 let first = members[0], category = first.category, artifact = first.artifact
-                guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(artifact.architecture) else {
+                guard [NativeArchitecture.identifier, NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(artifact.architecture) else {
                     throw WorkshopError("This custom base architecture needs a compatible Loom Workshop version.")
                 }
                 let baseWeightsURL = try modelPath(artifact.weightsPath, in: studio.packageURL)
@@ -118,7 +118,7 @@ struct NativeWorkshopEngine: Sendable {
                 if architecture.isCompact { try Self.includeCompactLicense(in: package) }
                 let frozen = try NativeWeights.read(from: baseWeightsURL)
                 let restored = resuming ? try restoreCheckpoint(run: run, category: category, map: artifact.map,
-                    baseHash: baseHash, studio: studio, memberCount: members.count) : nil
+                    baseHash: baseHash, studio: studio, memberCount: members.count, architecture: architecture) : nil
                 if let restored {
                     sampler = restored.state.samplingState
                     orderGenerator.state = UInt64(restored.state.orderState)!
@@ -128,7 +128,8 @@ struct NativeWorkshopEngine: Sendable {
                     beta1: options.optimizer == .sgd ? 0.9 : options.beta1,
                     beta2: options.optimizer == .sgd ? 0.999 : options.beta2,
                     momentum: options.optimizer == .sgd ? options.momentum : 0.9, gradientClipNorm: options.maxGradientNorm,
-                    scalarLoss: architecture.isCompact ? .linearDetailV1 : .absoluteV1)
+                    scalarLoss: architecture.isCompact ? .linearDetailV1
+                        : architecture.isResidualV2 ? .logitCrossEntropyV2 : .absoluteV1)
                 let session = try NativeTrainingSession(architecture: architecture, options: nativeOptions, seed: UInt64(options.seed),
                     weights: frozen, adapter: NativeAdapterConfiguration(rank: options.rank, alpha: options.alpha),
                     adapterWeights: restored?.weights, optimizerState: restored?.optimizer, initialUpdateCount: restored?.state.updates ?? 0,
@@ -419,6 +420,7 @@ struct NativeWorkshopEngine: Sendable {
         try Self.json(["schema": "loom-workshop-checkpoint-v3", "backend": "native-mpsgraph", "epoch": epoch,
             "updates": session.updateCount, "epoch_completed": epochCompleted, "base_id": studio.modelID, "base_version": studio.version,
             "category_id": category.id, "category_version": category.version, "map": map, "base_sha256": baseHash,
+            "architecture": session.architecture.identifier, "scalar_loss": session.options.scalarLoss.rawValue,
             "final_loss": loss, "rank": options.rank, "alpha": options.alpha, "options": try Self.dictionary(options),
             "weights_path": prefix + ".safetensors", "optimizer_path": prefix + ".optimizer.safetensors",
             "weights_sha256": try fileSHA(directory.appendingPathComponent(prefix + ".safetensors")),
@@ -435,7 +437,7 @@ struct NativeWorkshopEngine: Sendable {
     }
 
     private func restoreCheckpoint(run: URL, category: BaseManifest.Category, map: String, baseHash: String,
-                                   studio: StudioBase, memberCount: Int) throws -> RestoredCheckpoint? {
+                                   studio: StudioBase, memberCount: Int, architecture: NativeArchitecture) throws -> RestoredCheckpoint? {
         let directory = run.appendingPathComponent("checkpoints/" + Self.folderID(category.id) + "/" + map, isDirectory: true)
         guard FileManager.default.fileExists(atPath: directory.path) else { return nil }
         let checkpoints = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
@@ -451,6 +453,7 @@ struct NativeWorkshopEngine: Sendable {
         let batchCount = (memberCount + options.batchSize - 1) / options.batchSize
         guard state.baseID == studio.modelID, state.baseVersion == studio.version, state.categoryID == category.id,
               state.categoryVersion == category.version, state.map == map, state.baseSHA256 == baseHash,
+              state.matchesNativeContract(architecture),
               state.options == options, state.updates >= 0, state.finalLoss.isFinite,
               (1...options.epochs).contains(state.epoch), UInt64(state.orderState) != nil,
               state.epochOrder.count == memberCount, Set(state.epochOrder) == Set(0..<memberCount),

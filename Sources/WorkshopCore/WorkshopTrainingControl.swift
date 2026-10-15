@@ -92,6 +92,8 @@ struct WorkshopCheckpointState: Decodable {
     let categoryVersion: String
     let map: String
     let baseSHA256: String
+    let architecture: String?
+    let scalarLoss: String?
     let finalLoss: Double
     let options: WorkshopOptions
     let weightsPath: String
@@ -102,10 +104,22 @@ struct WorkshopCheckpointState: Decodable {
     let orderState: String
 
     enum CodingKeys: String, CodingKey {
-        case schema, epoch, updates, map, options
+        case schema, epoch, updates, map, options, architecture
+        case scalarLoss = "scalar_loss"
         case epochCompleted = "epoch_completed", nextBatch = "next_batch", epochOrder = "epoch_order"
         case baseID = "base_id", baseVersion = "base_version", categoryID = "category_id", categoryVersion = "category_version"
         case baseSHA256 = "base_sha256", finalLoss = "final_loss", weightsPath = "weights_path", optimizerPath = "optimizer_path"
         case weightsSHA256 = "weights_sha256", optimizerSHA256 = "optimizer_sha256", samplingState = "sampling_state", orderState = "order_state"
+    }
+
+    /// Tensor hashes alone cannot distinguish residual-v1/v2: their names,
+    /// shapes and seeded initial values intentionally match. New v2 checkpoints
+    /// must bind the graph and objective as well as the exact base bytes.
+    func matchesNativeContract(_ native: LoomNative.NativeArchitecture) -> Bool {
+        let expectedLoss: LoomNative.NativeScalarLoss = native.isCompact ? .linearDetailV1
+            : native.isResidualV2 ? .logitCrossEntropyV2 : .absoluteV1
+        if native.isResidualV2, architecture == nil || scalarLoss == nil { return false }
+        return (architecture == nil || architecture == native.identifier)
+            && (scalarLoss == nil || scalarLoss == expectedLoss.rawValue)
     }
 }

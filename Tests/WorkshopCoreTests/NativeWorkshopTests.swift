@@ -12,6 +12,56 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.identifier)
     }
 
+    func testResidualV2PlanOneUpdatePreservesBaseAndExportsCompatibleLoRA() async throws {
+        try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.residualV2Identifier)
+    }
+
+    func testResidualV2ArchitectureRequiresItsLeakyActivationContract() throws {
+        let architecture = try NativeArchitecture(mapKind: "depth", width: 4, blocks: 1,
+            identifier: NativeArchitecture.residualV2Identifier)
+        XCTAssertEqual(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth",
+            configuration: architecture.descriptor), architecture)
+        for (key, value) in [("hidden_activation", "relu" as Any), ("negative_slope", 0 as Any),
+            ("negative_slope", true as Any), ("padding", "reflect-v1" as Any),
+            ("id", NativeArchitecture.identifier as Any)] {
+            var changed = architecture.descriptor; changed[key] = value
+            XCTAssertThrowsError(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth", configuration: changed), key)
+        }
+        var missing = architecture.descriptor; missing.removeValue(forKey: "negative_slope")
+        XCTAssertThrowsError(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth", configuration: missing))
+    }
+
+    func testCheckpointGraphAndObjectiveBindingDistinguishesIdenticalResidualTensors() throws {
+        let old = try NativeArchitecture(mapKind: "depth", width: 4, blocks: 1)
+        let new = try NativeArchitecture(mapKind: "depth", width: 4, blocks: 1, identifier: NativeArchitecture.residualV2Identifier)
+        XCTAssertEqual(old.parameterShapes, new.parameterShapes)
+        let options = WorkshopOptions()
+        let sampler = NativeAugmentationPlan(seed: options.seed, cropRefresh: "per_epoch", augmentationRefresh: "per_epoch")
+        func dictionary<T: Encodable>(_ value: T) throws -> [String: Any] {
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as! [String: Any]
+        }
+        var object: [String: Any] = ["schema": "loom-workshop-checkpoint-v3", "epoch": 1, "updates": 1,
+            "epoch_completed": true, "next_batch": 1, "epoch_order": [0], "base_id": "base", "base_version": "1",
+            "category_id": "category", "category_version": "1", "map": "depth", "base_sha256": "identical-weight-bytes",
+            "final_loss": 0.1, "options": try dictionary(options),
+            "weights_path": "adapter.safetensors", "optimizer_path": "optimizer.safetensors",
+            "weights_sha256": "adapter", "optimizer_sha256": "optimizer",
+            "sampling_state": try dictionary(sampler), "order_state": "1"]
+        func state() throws -> WorkshopCheckpointState {
+            try JSONDecoder().decode(WorkshopCheckpointState.self, from: JSONSerialization.data(withJSONObject: object))
+        }
+        XCTAssertTrue(try state().matchesNativeContract(old), "Legacy checkpoints retain their recorded graph")
+        XCTAssertFalse(try state().matchesNativeContract(new), "Identical tensor identities cannot silently select v2")
+        object["architecture"] = new.identifier; object["scalar_loss"] = NativeScalarLoss.logitCrossEntropyV2.rawValue
+        XCTAssertTrue(try state().matchesNativeContract(new))
+        XCTAssertFalse(try state().matchesNativeContract(old))
+        object["scalar_loss"] = NativeScalarLoss.absoluteV1.rawValue
+        XCTAssertFalse(try state().matchesNativeContract(new))
+        object["scalar_loss"] = NativeScalarLoss.logitCrossEntropyV2.rawValue
+        object["architecture"] = old.identifier
+        XCTAssertFalse(try state().matchesNativeContract(new))
+    }
+
     func testPyramidPlanOneUpdatePreservesBaseAndExportsCompatibleLoRA() async throws {
         try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.pyramidIdentifier)
     }
@@ -63,6 +113,13 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as! [String: Any]
         XCTAssertEqual(metadata["updates"] as? Int, 1)
         XCTAssertEqual(metadata["base_weights_frozen"] as? Bool, true)
+        if architectureID == NativeArchitecture.residualV2Identifier {
+            XCTAssertEqual(metadata["scalar_loss"] as? String, NativeScalarLoss.logitCrossEntropyV2.rawValue)
+            let config = try XCTUnwrap(metadata["architecture_config"] as? [String: Any])
+            XCTAssertEqual(config["id"] as? String, architectureID)
+            XCTAssertEqual(config["hidden_activation"] as? String, "leaky-relu")
+            XCTAssertEqual(config["negative_slope"] as? Double, 0.1)
+        }
         if architectureID == NativeArchitecture.compactIdentifier {
             XCTAssertEqual(weights.count, 86)
             XCTAssertFalse(weights.keys.contains { $0.contains(".depthwise.") || $0.contains(".norm") })
@@ -85,6 +142,13 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         let run = adapter.deletingLastPathComponent()
         let checkpoints = try FileManager.default.subpathsOfDirectory(atPath: run.appendingPathComponent("checkpoints").path)
         XCTAssertTrue(checkpoints.contains { $0.hasSuffix(".optimizer.safetensors") })
+        if architectureID == NativeArchitecture.residualV2Identifier {
+            let relative = try XCTUnwrap(checkpoints.first { $0.hasSuffix(".json") })
+            let checkpoint = try JSONDecoder().decode(WorkshopCheckpointState.self,
+                from: Data(contentsOf: run.appendingPathComponent("checkpoints/" + relative)))
+            XCTAssertEqual(checkpoint.architecture, architectureID)
+            XCTAssertEqual(checkpoint.scalarLoss, NativeScalarLoss.logitCrossEntropyV2.rawValue)
+        }
         XCTAssertEqual(try Data(contentsOf: fixture.diffuse), fixture.originalDiffuse)
         XCTAssertEqual(try Data(contentsOf: fixture.target), fixture.originalTarget)
     }
@@ -151,7 +215,15 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
     }
 
     func testManualCheckpointThenSaveAndStopResumesExactPartialEpoch() async throws {
-        let fixture = try NativeWorkshopFixture()
+        try await checkManualCheckpointThenSaveAndStopResumesExactPartialEpoch(architectureID: NativeArchitecture.identifier)
+    }
+
+    func testResidualV2ManualCheckpointThenSaveAndStopResumesExactPartialEpoch() async throws {
+        try await checkManualCheckpointThenSaveAndStopResumesExactPartialEpoch(architectureID: NativeArchitecture.residualV2Identifier)
+    }
+
+    private func checkManualCheckpointThenSaveAndStopResumesExactPartialEpoch(architectureID: String) async throws {
+        let fixture = try NativeWorkshopFixture(architectureID: architectureID)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         for index in 1...2 {
             for (original, role) in [(fixture.diffuse, "diffuse"), (fixture.target, "depth")] {

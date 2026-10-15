@@ -33,16 +33,7 @@ func modelPath(_ relative: String, in root: URL) throws -> URL {
     return file
 }
 func fileSHA(_ file: URL, cancellation: NativeCancellation? = nil) throws -> String {
-    try cancellation?.check()
-    let handle = try FileHandle(forReadingFrom: file); defer { try? handle.close() }
-    var digest = SHA256()
-    while true {
-        try cancellation?.check()
-        guard let bytes = try handle.read(upToCount: 1_048_576), !bytes.isEmpty else { break }
-        digest.update(data: bytes)
-    }
-    try cancellation?.check()
-    return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    try NativeFileHash.sha256(file) { try cancellation?.check() }
 }
 func verifyFiles(_ files: [BaseManifest.File], root: URL, cancellation: NativeCancellation? = nil) throws {
     try cancellation?.check()
@@ -57,18 +48,20 @@ func verifyFiles(_ files: [BaseManifest.File], root: URL, cancellation: NativeCa
 /// descriptors keep their established optional fields; Compact records every
 /// constructor field needed to distinguish its linear head and native grid.
 func nativeBaseArchitecture(identifier: String, map: String, configuration: [String: Any]) throws -> NativeArchitecture {
-    guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(identifier),
+    guard [NativeArchitecture.identifier, NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(identifier),
           configuration["id"] as? String == identifier,
           let width = configuration["width"] as? Int, let blocks = configuration["blocks"] as? Int else {
         throw WorkshopError("The installed base is missing its compatible native architecture configuration.")
     }
     let architecture = try NativeArchitecture(mapKind: map, width: width, blocks: blocks, identifier: identifier)
-    if architecture.isCompact {
+    if architecture.isCompact || architecture.isResidualV2 {
         let expected = architecture.descriptor
         let recorded = configuration.filter { expected[$0.key] != nil }
         guard try JSONSerialization.data(withJSONObject: expected, options: [.sortedKeys])
                 == JSONSerialization.data(withJSONObject: recorded, options: [.sortedKeys]) else {
-            throw WorkshopError("The installed Compact model has an incompatible native grid, padding, linear output or adapter contract.")
+            throw WorkshopError(architecture.isCompact
+                ? "The installed Compact model has an incompatible native grid, padding, linear output or adapter contract."
+                : "The installed residual v2 model has an incompatible native activation, padding or output contract.")
         }
     }
     return architecture
@@ -149,7 +142,7 @@ func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) thr
             try cancellation?.check()
             let parent = (model.weightsPath as NSString).deletingLastPathComponent
             let relative = parent.isEmpty ? "model.json" : parent + "/model.json"
-            guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(model.architecture),
+            guard [NativeArchitecture.identifier, NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(model.architecture),
                   let path = try? modelPath(relative, in: root), inventory.contains(relative),
                   let data = try? Data(contentsOf: path),
                   let descriptor = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -159,8 +152,8 @@ func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) thr
                   let width = config["width"] as? Int, let blocks = config["blocks"] as? Int,
                   (4...512).contains(width), (1...64).contains(blocks),
                   (try? NativeArchitecture(mapKind: model.map, width: width, blocks: blocks, identifier: model.architecture)) != nil else {
-                if model.architecture == NativeArchitecture.compactIdentifier {
-                    throw WorkshopError("The installed Compact base is missing its complete native architecture configuration.")
+                if model.architecture == NativeArchitecture.compactIdentifier || model.architecture == NativeArchitecture.residualV2Identifier {
+                    throw WorkshopError("The installed base is missing its complete native architecture configuration.")
                 }
                 return nil
             }
