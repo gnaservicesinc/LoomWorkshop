@@ -16,6 +16,26 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.pyramidIdentifier)
     }
 
+    func testCompactPlanOneUpdatePreservesBaseAndExportsDenseCompatibleLoRA() async throws {
+        try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.compactIdentifier)
+    }
+
+    func testCompactArchitectureRejectsMissingOrConflictingNativeContracts() throws {
+        let architecture = try NativeArchitecture(mapKind: "depth", width: 32, blocks: 1,
+                                                   identifier: NativeArchitecture.compactIdentifier)
+        XCTAssertEqual(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth",
+                                                   configuration: architecture.descriptor), architecture)
+        for (key, value) in [("head_activation", "sigmoid" as Any), ("grid_multiple", 1 as Any),
+                             ("padding", "zero" as Any), ("normal_output_transform", "normalize" as Any),
+                             ("lora_scope", "all-convolutions" as Any), ("scale_channels", [32, 64, 128] as Any),
+                             ("grid_multiple", true as Any)] {
+            var changed = architecture.descriptor; changed[key] = value
+            XCTAssertThrowsError(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth", configuration: changed), key)
+        }
+        var missing = architecture.descriptor; missing.removeValue(forKey: "lora_scope")
+        XCTAssertThrowsError(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth", configuration: missing))
+    }
+
     private func checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: String) async throws {
         let fixture = try NativeWorkshopFixture(architectureID: architectureID)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -43,6 +63,18 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as! [String: Any]
         XCTAssertEqual(metadata["updates"] as? Int, 1)
         XCTAssertEqual(metadata["base_weights_frozen"] as? Bool, true)
+        if architectureID == NativeArchitecture.compactIdentifier {
+            XCTAssertEqual(weights.count, 86)
+            XCTAssertFalse(weights.keys.contains { $0.contains(".depthwise.") || $0.contains(".norm") })
+            let targets = try XCTUnwrap(metadata["targets"] as? [String])
+            XCTAssertEqual(targets.count, 43)
+            XCTAssertFalse(targets.contains { $0.hasSuffix(".depthwise") || $0.contains(".norm") })
+            XCTAssertEqual(metadata["scalar_loss"] as? String, NativeScalarLoss.linearDetailV1.rawValue)
+            let license = adapter.appendingPathComponent("licenses/NAFNet_LICENSE")
+            XCTAssertTrue(try String(contentsOf: license, encoding: .utf8).contains("Copyright (c) 2022 megvii-model"))
+            let files = try XCTUnwrap(manifest["files"] as? [[String: String]])
+            XCTAssertEqual(files.first { $0["path"] == "licenses/NAFNet_LICENSE" }?["sha256"], try fileSHA(license))
+        }
         XCTAssertLessThan(try XCTUnwrap(metadata["coreml_maximum_absolute_difference"] as? Double), 0.0006)
         XCTAssertEqual(try Data(contentsOf: fixture.baseWeights), original)
         XCTAssertEqual(model["baseSHA256"] as? String, try fileSHA(fixture.baseWeights))
@@ -211,8 +243,10 @@ private struct NativeWorkshopFixture {
         try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
         try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "org.ipde.texture-studio"], format: .xml, options: 0)
             .write(to: application.appendingPathComponent("Contents/Info.plist"))
-        let architecture = try NativeArchitecture(mapKind: "depth", width: 4, blocks: 1, identifier: architectureID)
-        let initial = try NativeTrainingSession(architecture: architecture, options: NativeTrainingOptions(), seed: 42)
+        let architecture = try NativeArchitecture(mapKind: "depth", width: architectureID == NativeArchitecture.compactIdentifier ? 32 : 4,
+                                                   blocks: 1, identifier: architectureID)
+        let initial = try NativeTrainingSession(architecture: architecture,
+            options: NativeTrainingOptions(scalarLoss: architecture.isCompact ? .linearDetailV1 : .absoluteV1), seed: 42)
         baseWeights = models.appendingPathComponent("weights.safetensors")
         try NativeWeights.write(initial.weights(), to: baseWeights)
         try NativeWorkshopEngine.json(["architecture_config": architecture.descriptor], to: models.appendingPathComponent("model.json"))

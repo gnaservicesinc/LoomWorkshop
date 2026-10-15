@@ -30,12 +30,10 @@ do {
     try run("/usr/bin/codesign", ["--verify", "--strict", "--verbose=2", stage.path])
     var backup: URL?
     if files.fileExists(atPath: destination.path) {
-        let backupRoot = installationRoot.path == "/"
-            ? files.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Loom Workshop/Backups", isDirectory: true)
-            : installationRoot.appendingPathComponent(".loom-suite-backups/Loom Workshop", isDirectory: true)
-        try files.createDirectory(at: backupRoot, withIntermediateDirectories: true)
-        let timestamp = DateFormatter(); timestamp.dateFormat = "yyyyMMdd-HHmmss"; timestamp.timeZone = TimeZone(secondsFromGMT: 0)
-        backup = backupRoot.appendingPathComponent("Loom Workshop.backup-" + timestamp.string(from: Date()) + "-" + UUID().uuidString.prefix(8) + ".app", isDirectory: true)
+        // Keep a rollback copy only while the replacement is being verified.
+        // Successful installation leaves one current app, without old bundles.
+        backup = destination.deletingLastPathComponent().appendingPathComponent(
+            ".Loom Workshop.rollback-" + UUID().uuidString + ".app", isDirectory: true)
         try files.moveItem(at: destination, to: backup!)
     }
     do {
@@ -46,8 +44,8 @@ do {
         if let backup { try? files.moveItem(at: backup, to: destination) }
         throw error
     }
+    if let backup { try files.removeItem(at: backup) }
     print(destination.path)
-    if let backup { print("Previous app retained at " + backup.path) }
 } catch {
     FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
     exit(1)

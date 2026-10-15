@@ -99,7 +99,7 @@ struct NativeWorkshopEngine: Sendable {
                 try cancellation.check()
                 let members = groups[key]!
                 let first = members[0], category = first.category, artifact = first.artifact
-                guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier].contains(artifact.architecture) else {
+                guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(artifact.architecture) else {
                     throw WorkshopError("This custom base architecture needs a compatible Loom Workshop version.")
                 }
                 let baseWeightsURL = try modelPath(artifact.weightsPath, in: studio.packageURL)
@@ -108,11 +108,14 @@ struct NativeWorkshopEngine: Sendable {
                 guard let descriptor = try JSONSerialization.jsonObject(with: Data(contentsOf: descriptorURL)) as? [String: Any],
                       (descriptor["architecture"] as? String).map({ $0 == artifact.architecture }) ?? true,
                       let config = (descriptor["architecture_config"] ?? descriptor["architecture"]) as? [String: Any],
-                      config["id"] as? String == artifact.architecture,
-                      let width = config["width"] as? Int, let blocks = config["blocks"] as? Int else {
+                      config["id"] as? String == artifact.architecture else {
                     throw WorkshopError("The installed base is missing its LoRA architecture configuration.")
                 }
-                let architecture = try NativeArchitecture(mapKind: artifact.map, width: width, blocks: blocks, identifier: artifact.architecture)
+                let architecture = try nativeBaseArchitecture(identifier: artifact.architecture, map: artifact.map, configuration: config)
+                guard architecture.supportsGrid(height: options.imageSize, width: options.imageSize) else {
+                    throw WorkshopError("The Compact base needs a native crop of at least 32 pixels with dimensions divisible by eight. Originals are unchanged.")
+                }
+                if architecture.isCompact { try Self.includeCompactLicense(in: package) }
                 let frozen = try NativeWeights.read(from: baseWeightsURL)
                 let restored = resuming ? try restoreCheckpoint(run: run, category: category, map: artifact.map,
                     baseHash: baseHash, studio: studio, memberCount: members.count) : nil
@@ -124,11 +127,12 @@ struct NativeWorkshopEngine: Sendable {
                 let nativeOptions = try NativeTrainingOptions(optimizer: options.optimizer.rawValue, weightDecay: options.weightDecay,
                     beta1: options.optimizer == .sgd ? 0.9 : options.beta1,
                     beta2: options.optimizer == .sgd ? 0.999 : options.beta2,
-                    momentum: options.optimizer == .sgd ? options.momentum : 0.9, gradientClipNorm: options.maxGradientNorm)
+                    momentum: options.optimizer == .sgd ? options.momentum : 0.9, gradientClipNorm: options.maxGradientNorm,
+                    scalarLoss: architecture.isCompact ? .linearDetailV1 : .absoluteV1)
                 let session = try NativeTrainingSession(architecture: architecture, options: nativeOptions, seed: UInt64(options.seed),
                     weights: frozen, adapter: NativeAdapterConfiguration(rank: options.rank, alpha: options.alpha),
                     adapterWeights: restored?.weights, optimizerState: restored?.optimizer, initialUpdateCount: restored?.state.updates ?? 0,
-                    device: options.device.rawValue, cancellation: cancellation, channelsLast: !architecture.isPyramid)
+                    device: options.device.rawValue, cancellation: cancellation)
                 let stepsPerEpoch = Self.stepsPerEpoch(samples: members.count, options: options)
                 let groupTotal = stepsPerEpoch * options.epochs
                 let baseParameters = frozen.values.reduce(0) { $0 + $1.values.count }
@@ -223,8 +227,9 @@ struct NativeWorkshopEngine: Sendable {
                 try Self.json(["schema": "loom-workshop-lora-v1", "backend": "native-mpsgraph", "base_id": studio.modelID,
                     "base_version": studio.version, "category_id": category.id, "category_version": category.version,
                     "map": artifact.map, "base_sha256": baseHash, "rank": options.rank, "alpha": options.alpha,
-                    "targets": frozen.keys.filter { $0.hasSuffix(".weight") }.map { String($0.dropLast(7)) }.sorted(),
+                    "targets": architecture.adaptableConvolutionNames.sorted(),
                     "architecture_config": config, "epochs": options.epochs, "updates": session.updateCount, "final_loss": finalLoss,
+                    "scalar_loss": nativeOptions.scalarLoss.rawValue,
                     "base_weights_frozen": true, "coreml_maximum_absolute_difference": difference,
                     "training_options": try Self.dictionary(options), "base_parameters": baseParameters,
                     "trainable_parameters": trainableParameters,
@@ -477,6 +482,20 @@ struct NativeWorkshopEngine: Sendable {
         }
         return SHA256.hash(data: try JSONSerialization.data(withJSONObject: records, options: [.sortedKeys]))
             .map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func includeCompactLicense(in package: URL) throws {
+        let relative = "ModelLicenses/NAFNet_LICENSE"
+        let developmentResources = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources")
+        let candidates = [Bundle.main.resourceURL?.appendingPathComponent(relative),
+                          developmentResources.appendingPathComponent(relative)].compactMap { $0 }
+        guard let notice = candidates.lazy.compactMap({ try? Data(contentsOf: $0) }).first else {
+            throw WorkshopError("The Compact model's required NAFNet license notice is missing. Reinstall Loom Workshop before exporting this adapter.")
+        }
+        let licenses = package.appendingPathComponent("licenses", isDirectory: true)
+        try FileManager.default.createDirectory(at: licenses, withIntermediateDirectories: true)
+        try notice.write(to: licenses.appendingPathComponent("NAFNet_LICENSE"), options: .atomic)
     }
 
     private func compatibilityProof(session: NativeTrainingSession, compiled: URL, map: String) throws -> Double {

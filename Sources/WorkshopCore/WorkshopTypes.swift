@@ -23,7 +23,7 @@ public struct BaseModelProfile: Codable, Sendable, Identifiable {
         guard (1...128).contains(rank), (4...512).contains(width), (1...64).contains(blocks) else { return 0 }
         guard let network = try? NativeArchitecture(mapKind: map, width: width, blocks: blocks,
             identifier: architecture ?? NativeArchitecture.identifier) else { return 0 }
-        return network.convolutionNames.reduce(0) { count, name in
+        return network.adaptableConvolutionNames.reduce(0) { count, name in
             let shape = network.parameterShapes[name + ".weight"]!
             return count + rank * (shape[1] * shape[2] * shape[3] + shape[0])
         }

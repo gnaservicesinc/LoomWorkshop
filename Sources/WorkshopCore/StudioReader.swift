@@ -52,6 +52,28 @@ func verifyFiles(_ files: [BaseManifest.File], root: URL, cancellation: NativeCa
         guard try fileSHA(modelPath(entry.path, in: root), cancellation: cancellation) == entry.sha256.lowercased() else { throw WorkshopError("A model file is missing or changed: \(entry.path).") }
     }
 }
+
+/// New architecture contracts are checked before adaptation. Legacy model
+/// descriptors keep their established optional fields; Compact records every
+/// constructor field needed to distinguish its linear head and native grid.
+func nativeBaseArchitecture(identifier: String, map: String, configuration: [String: Any]) throws -> NativeArchitecture {
+    guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(identifier),
+          configuration["id"] as? String == identifier,
+          let width = configuration["width"] as? Int, let blocks = configuration["blocks"] as? Int else {
+        throw WorkshopError("The installed base is missing its compatible native architecture configuration.")
+    }
+    let architecture = try NativeArchitecture(mapKind: map, width: width, blocks: blocks, identifier: identifier)
+    if architecture.isCompact {
+        let expected = architecture.descriptor
+        let recorded = configuration.filter { expected[$0.key] != nil }
+        guard try JSONSerialization.data(withJSONObject: expected, options: [.sortedKeys])
+                == JSONSerialization.data(withJSONObject: recorded, options: [.sortedKeys]) else {
+            throw WorkshopError("The installed Compact model has an incompatible native grid, padding, linear output or adapter contract.")
+        }
+    }
+    return architecture
+}
+
 func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) throws -> (StudioBase, BaseManifest) {
     try cancellation?.check()
     let app = application.standardizedFileURL.resolvingSymlinksInPath()
@@ -127,7 +149,7 @@ func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) thr
             try cancellation?.check()
             let parent = (model.weightsPath as NSString).deletingLastPathComponent
             let relative = parent.isEmpty ? "model.json" : parent + "/model.json"
-            guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier].contains(model.architecture),
+            guard [NativeArchitecture.identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(model.architecture),
                   let path = try? modelPath(relative, in: root), inventory.contains(relative),
                   let data = try? Data(contentsOf: path),
                   let descriptor = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -136,7 +158,13 @@ func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) thr
                   config["id"] as? String == model.architecture,
                   let width = config["width"] as? Int, let blocks = config["blocks"] as? Int,
                   (4...512).contains(width), (1...64).contains(blocks),
-                  (try? NativeArchitecture(mapKind: model.map, width: width, blocks: blocks, identifier: model.architecture)) != nil else { return nil }
+                  (try? NativeArchitecture(mapKind: model.map, width: width, blocks: blocks, identifier: model.architecture)) != nil else {
+                if model.architecture == NativeArchitecture.compactIdentifier {
+                    throw WorkshopError("The installed Compact base is missing its complete native architecture configuration.")
+                }
+                return nil
+            }
+            _ = try nativeBaseArchitecture(identifier: model.architecture, map: model.map, configuration: config)
             return BaseModelProfile(map: model.map, width: width, blocks: blocks, architecture: model.architecture)
         }
         return BaseDataset(id: category.id, name: category.name, version: category.version,
