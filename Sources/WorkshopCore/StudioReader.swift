@@ -48,20 +48,20 @@ func verifyFiles(_ files: [BaseManifest.File], root: URL, cancellation: NativeCa
 /// descriptors keep their established optional fields; Compact records every
 /// constructor field needed to distinguish its linear head and native grid.
 func nativeBaseArchitecture(identifier: String, map: String, configuration: [String: Any]) throws -> NativeArchitecture {
-    guard [NativeArchitecture.identifier, NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(identifier),
+    guard NativeArchitecture.supportedIdentifiers.contains(identifier),
           configuration["id"] as? String == identifier,
           let width = configuration["width"] as? Int, let blocks = configuration["blocks"] as? Int else {
         throw WorkshopError("The installed base is missing its compatible native architecture configuration.")
     }
     let architecture = try NativeArchitecture(mapKind: map, width: width, blocks: blocks, identifier: identifier)
-    if architecture.isCompact || architecture.isResidualV2 {
+    if architecture.isCompact || architecture.usesLeakyActivation {
         let expected = architecture.descriptor
         let recorded = configuration.filter { expected[$0.key] != nil }
         guard try JSONSerialization.data(withJSONObject: expected, options: [.sortedKeys])
                 == JSONSerialization.data(withJSONObject: recorded, options: [.sortedKeys]) else {
             throw WorkshopError(architecture.isCompact
                 ? "The installed Compact model has an incompatible native grid, padding, linear output or adapter contract."
-                : "The installed residual v2 model has an incompatible native activation, padding or output contract.")
+                : "The installed versioned model has an incompatible native activation, feature scale, padding or output contract.")
         }
     }
     return architecture
@@ -142,7 +142,7 @@ func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) thr
             try cancellation?.check()
             let parent = (model.weightsPath as NSString).deletingLastPathComponent
             let relative = parent.isEmpty ? "model.json" : parent + "/model.json"
-            guard [NativeArchitecture.identifier, NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(model.architecture),
+            guard NativeArchitecture.supportedIdentifiers.contains(model.architecture),
                   let path = try? modelPath(relative, in: root), inventory.contains(relative),
                   let data = try? Data(contentsOf: path),
                   let descriptor = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -152,7 +152,7 @@ func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) thr
                   let width = config["width"] as? Int, let blocks = config["blocks"] as? Int,
                   (4...512).contains(width), (1...64).contains(blocks),
                   (try? NativeArchitecture(mapKind: model.map, width: width, blocks: blocks, identifier: model.architecture)) != nil else {
-                if model.architecture == NativeArchitecture.compactIdentifier || model.architecture == NativeArchitecture.residualV2Identifier {
+                if model.architecture == NativeArchitecture.compactIdentifier || [NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidV2Identifier].contains(model.architecture) {
                     throw WorkshopError("The installed base is missing its complete native architecture configuration.")
                 }
                 return nil

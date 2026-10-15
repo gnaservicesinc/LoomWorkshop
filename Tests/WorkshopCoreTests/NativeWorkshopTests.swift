@@ -12,6 +12,20 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.identifier)
     }
 
+    func testPyramidV2PlanOneUpdatePreservesBaseAndExportsCompatibleLoRA() async throws {
+        try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.pyramidV2Identifier)
+    }
+
+    func testPyramidV2RequiresBothActivationAndScaleContracts() throws {
+        let architecture = try NativeArchitecture(mapKind: "depth", width: 4, blocks: 1,
+            identifier: NativeArchitecture.pyramidV2Identifier)
+        XCTAssertEqual(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth", configuration: architecture.descriptor), architecture)
+        for key in ["negative_slope", "hidden_activation", "scale_channels", "upsampling"] {
+            var missing = architecture.descriptor; missing.removeValue(forKey: key)
+            XCTAssertThrowsError(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth", configuration: missing), key)
+        }
+    }
+
     func testResidualV2PlanOneUpdatePreservesBaseAndExportsCompatibleLoRA() async throws {
         try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.residualV2Identifier)
     }
@@ -113,7 +127,7 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as! [String: Any]
         XCTAssertEqual(metadata["updates"] as? Int, 1)
         XCTAssertEqual(metadata["base_weights_frozen"] as? Bool, true)
-        if architectureID == NativeArchitecture.residualV2Identifier {
+        if [NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidV2Identifier].contains(architectureID) {
             XCTAssertEqual(metadata["scalar_loss"] as? String, NativeScalarLoss.logitCrossEntropyV2.rawValue)
             let config = try XCTUnwrap(metadata["architecture_config"] as? [String: Any])
             XCTAssertEqual(config["id"] as? String, architectureID)
@@ -142,7 +156,7 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         let run = adapter.deletingLastPathComponent()
         let checkpoints = try FileManager.default.subpathsOfDirectory(atPath: run.appendingPathComponent("checkpoints").path)
         XCTAssertTrue(checkpoints.contains { $0.hasSuffix(".optimizer.safetensors") })
-        if architectureID == NativeArchitecture.residualV2Identifier {
+        if [NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidV2Identifier].contains(architectureID) {
             let relative = try XCTUnwrap(checkpoints.first { $0.hasSuffix(".json") })
             let checkpoint = try JSONDecoder().decode(WorkshopCheckpointState.self,
                 from: Data(contentsOf: run.appendingPathComponent("checkpoints/" + relative)))

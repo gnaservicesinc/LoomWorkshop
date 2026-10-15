@@ -99,7 +99,7 @@ struct NativeWorkshopEngine: Sendable {
                 try cancellation.check()
                 let members = groups[key]!
                 let first = members[0], category = first.category, artifact = first.artifact
-                guard [NativeArchitecture.identifier, NativeArchitecture.residualV2Identifier, NativeArchitecture.pyramidIdentifier, NativeArchitecture.compactIdentifier].contains(artifact.architecture) else {
+                guard NativeArchitecture.supportedIdentifiers.contains(artifact.architecture) else {
                     throw WorkshopError("This custom base architecture needs a compatible Loom Workshop version.")
                 }
                 let baseWeightsURL = try modelPath(artifact.weightsPath, in: studio.packageURL)
@@ -129,7 +129,7 @@ struct NativeWorkshopEngine: Sendable {
                     beta2: options.optimizer == .sgd ? 0.999 : options.beta2,
                     momentum: options.optimizer == .sgd ? options.momentum : 0.9, gradientClipNorm: options.maxGradientNorm,
                     scalarLoss: architecture.isCompact ? .linearDetailV1
-                        : architecture.isResidualV2 ? .logitCrossEntropyV2 : .absoluteV1)
+                        : architecture.usesLeakyActivation ? .logitCrossEntropyV2 : .absoluteV1)
                 let session = try NativeTrainingSession(architecture: architecture, options: nativeOptions, seed: UInt64(options.seed),
                     weights: frozen, adapter: NativeAdapterConfiguration(rank: options.rank, alpha: options.alpha),
                     adapterWeights: restored?.weights, optimizerState: restored?.optimizer, initialUpdateCount: restored?.state.updates ?? 0,

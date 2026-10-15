@@ -117,8 +117,8 @@ struct WorkshopCheckpointState: Decodable {
     /// must bind the graph and objective as well as the exact base bytes.
     func matchesNativeContract(_ native: LoomNative.NativeArchitecture) -> Bool {
         let expectedLoss: LoomNative.NativeScalarLoss = native.isCompact ? .linearDetailV1
-            : native.isResidualV2 ? .logitCrossEntropyV2 : .absoluteV1
-        if native.isResidualV2, architecture == nil || scalarLoss == nil { return false }
+            : native.usesLeakyActivation ? .logitCrossEntropyV2 : .absoluteV1
+        if native.usesLeakyActivation, architecture == nil || scalarLoss == nil { return false }
         return (architecture == nil || architecture == native.identifier)
             && (scalarLoss == nil || scalarLoss == expectedLoss.rawValue)
     }
