@@ -8,6 +8,18 @@ import XCTest
 @testable import WorkshopCore
 
 final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
+    func testCompactRecordedObjectiveIsRetainedAndUnknownObjectivesFail() throws {
+        XCTAssertEqual(try NativeWorkshopEngine.compactObjective(descriptor: [:]), .linearDetailV1)
+        XCTAssertEqual(try NativeWorkshopEngine.compactObjective(descriptor: ["training": ["scalar_loss": "squared-structure-v1"]]), .squaredStructureV1)
+        XCTAssertThrowsError(try NativeWorkshopEngine.compactObjective(descriptor: ["training": ["scalar_loss": "unknown-loss"]]))
+        XCTAssertThrowsError(try NativeWorkshopEngine.compactObjective(descriptor: ["training": ["scalar_loss": "native-detail-v3"]]))
+    }
+
+    func testCompactSquaredObjectiveTrainsAnAdapterWithoutChangingBasePixelsOrWeights() async throws {
+        try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(
+            architectureID: NativeArchitecture.compactIdentifier, objective: .squaredStructureV1)
+    }
+
     func testNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA() async throws {
         try await checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: NativeArchitecture.identifier)
     }
@@ -100,8 +112,9 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
         XCTAssertThrowsError(try nativeBaseArchitecture(identifier: architecture.identifier, map: "depth", configuration: missing))
     }
 
-    private func checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: String) async throws {
-        let fixture = try NativeWorkshopFixture(architectureID: architectureID)
+    private func checkNativePlanOneUpdatePreservesBaseAndExportsCompatibleLoRA(architectureID: String,
+            objective: NativeScalarLoss? = nil) async throws {
+        let fixture = try NativeWorkshopFixture(architectureID: architectureID, objective: objective)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let original = try Data(contentsOf: fixture.baseWeights)
         let project = try WorkshopProject(sourceFolder: fixture.images, textureStudio: fixture.application)
@@ -140,7 +153,7 @@ final class NativeWorkshopTests: XCTestCase, @unchecked Sendable {
             let targets = try XCTUnwrap(metadata["targets"] as? [String])
             XCTAssertEqual(targets.count, 43)
             XCTAssertFalse(targets.contains { $0.hasSuffix(".depthwise") || $0.contains(".norm") })
-            XCTAssertEqual(metadata["scalar_loss"] as? String, NativeScalarLoss.linearDetailV1.rawValue)
+            XCTAssertEqual(metadata["scalar_loss"] as? String, (objective ?? .linearDetailV1).rawValue)
             let license = adapter.appendingPathComponent("licenses/NAFNet_LICENSE")
             XCTAssertTrue(try String(contentsOf: license, encoding: .utf8).contains("Copyright (c) 2022 megvii-model"))
             let files = try XCTUnwrap(manifest["files"] as? [[String: String]])
@@ -320,7 +333,7 @@ private struct NativeWorkshopFixture {
     let target: URL
     let originalDiffuse: Data
     let originalTarget: Data
-    init(architectureID: String = NativeArchitecture.identifier) throws {
+    init(architectureID: String = NativeArchitecture.identifier, objective: NativeScalarLoss? = nil) throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("native-workshop-" + UUID().uuidString, isDirectory: true).resolvingSymlinksInPath()
         application = root.appendingPathComponent("Texture Studio.app", isDirectory: true)
         images = root.appendingPathComponent("Images", isDirectory: true)
@@ -335,7 +348,9 @@ private struct NativeWorkshopFixture {
             options: NativeTrainingOptions(scalarLoss: architecture.isCompact ? .linearDetailV1 : .absoluteV1), seed: 42)
         baseWeights = models.appendingPathComponent("weights.safetensors")
         try NativeWeights.write(initial.weights(), to: baseWeights)
-        try NativeWorkshopEngine.json(["architecture_config": architecture.descriptor], to: models.appendingPathComponent("model.json"))
+        var descriptor: [String: Any] = ["architecture_config": architecture.descriptor]
+        if let objective { descriptor["training"] = ["scalar_loss": objective.rawValue] }
+        try NativeWorkshopEngine.json(descriptor, to: models.appendingPathComponent("model.json"))
         _ = try NativeCoreML.export(weights: initial.weights(), architecture: architecture, imageSize: 32, to: models.appendingPathComponent("map.mlmodel"))
         // Factory category metadata is authoritative, so this fixture never invokes a classifier.
         try Data("unused classifier fixture".utf8).write(to: models.appendingPathComponent("classifier.native"))

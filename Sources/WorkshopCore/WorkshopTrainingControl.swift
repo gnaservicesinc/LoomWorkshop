@@ -115,9 +115,11 @@ struct WorkshopCheckpointState: Decodable {
     /// Tensor hashes alone cannot distinguish residual-v1/v2: their names,
     /// shapes and seeded initial values intentionally match. New v2 checkpoints
     /// must bind the graph and objective as well as the exact base bytes.
-    func matchesNativeContract(_ native: LoomNative.NativeArchitecture) -> Bool {
-        let expectedLoss: LoomNative.NativeScalarLoss = native.isCompact ? .linearDetailV1
+    func matchesNativeContract(_ native: LoomNative.NativeArchitecture, objective: LoomNative.NativeScalarLoss? = nil) -> Bool {
+        let defaultLoss: LoomNative.NativeScalarLoss = native.isCompact ? .linearDetailV1
             : native.usesLeakyActivation ? .logitCrossEntropyV2 : .absoluteV1
+        let expectedLoss = objective ?? defaultLoss
+        if expectedLoss != defaultLoss, scalarLoss == nil { return false }
         if native.usesLeakyActivation, architecture == nil || scalarLoss == nil { return false }
         return (architecture == nil || architecture == native.identifier)
             && (scalarLoss == nil || scalarLoss == expectedLoss.rawValue)

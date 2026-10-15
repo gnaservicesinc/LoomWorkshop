@@ -20,6 +20,14 @@ private struct ImageFingerprint: Sendable {
 }
 /// Native operations run in a detached task; the project actor remains available to cancel them.
 struct NativeWorkshopEngine: Sendable {
+    static func compactObjective(descriptor: [String: Any]) throws -> NativeScalarLoss {
+        let raw = (descriptor["training"] as? [String: Any])?["scalar_loss"] as? String
+            ?? NativeScalarLoss.linearDetailV1.rawValue
+        guard let loss = NativeScalarLoss(rawValue: raw), loss.isCompactObjective else {
+            throw WorkshopError("The Compact base records an unsupported training objective.")
+        }
+        return loss
+    }
     let source: URL
     let project: URL
     let application: URL
@@ -117,8 +125,10 @@ struct NativeWorkshopEngine: Sendable {
                 }
                 if architecture.isCompact { try Self.includeCompactLicense(in: package) }
                 let frozen = try NativeWeights.read(from: baseWeightsURL)
+                let objective: NativeScalarLoss = architecture.isCompact ? try Self.compactObjective(descriptor: descriptor)
+                    : architecture.usesLeakyActivation ? .logitCrossEntropyV2 : .absoluteV1
                 let restored = resuming ? try restoreCheckpoint(run: run, category: category, map: artifact.map,
-                    baseHash: baseHash, studio: studio, memberCount: members.count, architecture: architecture) : nil
+                    baseHash: baseHash, studio: studio, memberCount: members.count, architecture: architecture, objective: objective) : nil
                 if let restored {
                     sampler = restored.state.samplingState
                     orderGenerator.state = UInt64(restored.state.orderState)!
@@ -128,8 +138,7 @@ struct NativeWorkshopEngine: Sendable {
                     beta1: options.optimizer == .sgd ? 0.9 : options.beta1,
                     beta2: options.optimizer == .sgd ? 0.999 : options.beta2,
                     momentum: options.optimizer == .sgd ? options.momentum : 0.9, gradientClipNorm: options.maxGradientNorm,
-                    scalarLoss: architecture.isCompact ? .linearDetailV1
-                        : architecture.usesLeakyActivation ? .logitCrossEntropyV2 : .absoluteV1)
+                    scalarLoss: objective)
                 let session = try NativeTrainingSession(architecture: architecture, options: nativeOptions, seed: UInt64(options.seed),
                     weights: frozen, adapter: NativeAdapterConfiguration(rank: options.rank, alpha: options.alpha),
                     adapterWeights: restored?.weights, optimizerState: restored?.optimizer, initialUpdateCount: restored?.state.updates ?? 0,
@@ -437,7 +446,8 @@ struct NativeWorkshopEngine: Sendable {
     }
 
     private func restoreCheckpoint(run: URL, category: BaseManifest.Category, map: String, baseHash: String,
-                                   studio: StudioBase, memberCount: Int, architecture: NativeArchitecture) throws -> RestoredCheckpoint? {
+                                   studio: StudioBase, memberCount: Int, architecture: NativeArchitecture,
+                                   objective: NativeScalarLoss) throws -> RestoredCheckpoint? {
         let directory = run.appendingPathComponent("checkpoints/" + Self.folderID(category.id) + "/" + map, isDirectory: true)
         guard FileManager.default.fileExists(atPath: directory.path) else { return nil }
         let checkpoints = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
@@ -453,7 +463,7 @@ struct NativeWorkshopEngine: Sendable {
         let batchCount = (memberCount + options.batchSize - 1) / options.batchSize
         guard state.baseID == studio.modelID, state.baseVersion == studio.version, state.categoryID == category.id,
               state.categoryVersion == category.version, state.map == map, state.baseSHA256 == baseHash,
-              state.matchesNativeContract(architecture),
+              state.matchesNativeContract(architecture, objective: objective),
               state.options == options, state.updates >= 0, state.finalLoss.isFinite,
               (1...options.epochs).contains(state.epoch), UInt64(state.orderState) != nil,
               state.epochOrder.count == memberCount, Set(state.epochOrder) == Set(0..<memberCount),
