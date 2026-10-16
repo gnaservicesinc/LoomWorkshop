@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import ImageIO
 
-struct ImageTag: Codable, Sendable {
+struct ImageTag: Codable, Equatable, Sendable {
     var id: String
     var pairID: String
     var role: String
@@ -68,6 +68,9 @@ func imageTag(_ file: URL) -> ImageTag? {
     metadataBytes(file, key: tagKey).flatMap { try? JSONDecoder().decode(ImageTag.self, from: $0) }
 }
 func writeTag(_ tag: ImageTag, to file: URL) throws {
+    // Folder polling and classification revisit every image. Avoid changing
+    // filesystem metadata (and waking file watchers) when nothing changed.
+    guard imageTag(file) != tag else { return }
     let data = try JSONEncoder().encode(tag)
     let result = data.withUnsafeBytes { setxattr(file.path, tagKey, $0.baseAddress, data.count, 0, 0) }
     guard result == 0 else { throw WorkshopError("Image metadata could not be saved for \(file.lastPathComponent). Check that the source folder is writable.") }

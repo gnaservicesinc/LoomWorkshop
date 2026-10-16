@@ -25,6 +25,7 @@ public actor WorkshopProject {
     private var nativeCancellation: NativeCancellation?
     private var trainingControl: WorkshopTrainingControl?
     private var operationActive = false
+    private var studioInspection = StudioInspectionCache()
 
     public nonisolated static func inspectStudio(at application: URL) throws -> StudioBase { try readStudio(application).0 }
 
@@ -49,7 +50,7 @@ public actor WorkshopProject {
     }
 
     public func snapshot(imageSize: Int? = nil) throws -> WorkshopPlan {
-        let studio = try readStudio(textureStudio).0
+        let studio = try studioInspection.read(textureStudio)
         let size = imageSize ?? document.options.imageSize
         guard (32...8192).contains(size) else { throw WorkshopError("Choose a training dimension between 32 and 8,192 pixels.") }
         let samples = try currentSamples(source: sourceFolder, studio: studio, imageSize: size)
@@ -65,9 +66,11 @@ public actor WorkshopProject {
 
     public func updateOptions(_ options: WorkshopOptions) throws {
         try validate(options)
-        document.options = options
+        var updated = document
+        updated.options = options
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(document).write(to: projectFolder.appendingPathComponent("project.json"), options: .atomic)
+        try encoder.encode(updated).write(to: projectFolder.appendingPathComponent("project.json"), options: .atomic)
+        document = updated
     }
 
     public func latestAdapter() throws -> URL? {
@@ -144,8 +147,9 @@ public actor WorkshopProject {
         guard request.schema == "loom-workshop-run-v1" else { throw WorkshopError("This run lacks a supported continuation record.") }
         let resultURL = resolved.appendingPathComponent("result.json")
         let result = (try? JSONSerialization.jsonObject(with: Data(contentsOf: resultURL))) as? [String: Any]
-        guard result?["status"] as? String != "completed",
-              (try? validateAdapter(resolved.appendingPathComponent("adapter", isDirectory: true))) == nil else {
+        // The adapter manifest is the publication commit. A crash after the
+        // result record but before that commit must leave checkpoints resumable.
+        guard (try? validateAdapter(resolved.appendingPathComponent("adapter", isDirectory: true))) == nil else {
             throw WorkshopError("This run has already completed.")
         }
         let checkpointRoot = resolved.appendingPathComponent("checkpoints", isDirectory: true)

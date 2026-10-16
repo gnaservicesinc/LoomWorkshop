@@ -79,6 +79,7 @@ func readStudio(_ application: URL, cancellation: NativeCancellation? = nil) thr
     let manifest = try JSONDecoder().decode(BaseManifest.self, from: Data(contentsOf: root.appendingPathComponent("manifest.json")))
     guard manifest.schema == "texture-loom.package.v1", UUID(uuidString: manifest.id) != nil, !manifest.version.isEmpty,
           !manifest.categories.isEmpty, Set(manifest.categories.map(\.id)).count == manifest.categories.count,
+          manifest.categories.allSatisfy({ !$0.models.isEmpty && Set($0.models.map(\.map)).count == $0.models.count }),
           Set(manifest.classifier.labels.map(\.id)).count == manifest.classifier.labels.count,
           Set(manifest.classifier.labels.map(\.classifierValue)).count == manifest.classifier.labels.count,
           Set(manifest.classifier.labels.map(\.id)) == Set(manifest.categories.map(\.id)),

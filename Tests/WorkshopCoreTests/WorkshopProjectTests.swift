@@ -1,6 +1,7 @@
 import AppKit
 import CryptoKit
 import Darwin
+import LoomNative
 import XCTest
 @testable import WorkshopCore
 
@@ -26,6 +27,80 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(stateA.options, options)
         let json = try JSONSerialization.jsonObject(with: Data(contentsOf: a.appendingPathComponent(".loom-workshop/project.json"))) as! [String: Any]
         XCTAssertEqual(Set(json.keys), ["schema", "options"])
+    }
+
+    func testFailedOptionsSaveDoesNotReplaceLastPersistedSettingsInMemory() async throws {
+        let studio = try makeStudio(), source = try folder("Unwritable Settings")
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        var original = WorkshopOptions(); original.name = "Saved settings"
+        try await project.updateOptions(original)
+        let file = project.projectFolder.appendingPathComponent("project.json")
+        let persisted = try Data(contentsOf: file)
+        try FileManager.default.removeItem(at: file)
+        try FileManager.default.createDirectory(at: file, withIntermediateDirectories: false)
+        var replacement = original; replacement.name = "Unsaved settings"
+        do { try await project.updateOptions(replacement); XCTFail("A directory cannot be replaced by the project file.") }
+        catch {}
+        let state = try await project.snapshot()
+        XCTAssertEqual(state.options, original)
+        try FileManager.default.removeItem(at: file)
+        try persisted.write(to: file)
+        let reopened = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let restored = try await reopened.snapshot()
+        XCTAssertEqual(restored.options, state.options)
+    }
+
+    func testRepeatedFolderSnapshotsPreserveUnchangedImageMetadataBytes() async throws {
+        let studio = try makeStudio(), source = try folder("Stable Metadata")
+        let diffuse = source.appendingPathComponent("brick_diff.png")
+        try image(diffuse)
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        _ = try await project.snapshot(imageSize: 32)
+        let tag = try XCTUnwrap(imageTag(diffuse))
+        let key = "org.gnaservicesinc.loom-workshop.image.v1"
+        let original = try JSONEncoder().encode(tag)
+        let formatted = Data("\n  ".utf8) + original + Data("\n".utf8)
+        XCTAssertEqual(formatted.withUnsafeBytes { setxattr(diffuse.path, key, $0.baseAddress, formatted.count, 0, 0) }, 0)
+        var before = stat(); XCTAssertEqual(lstat(diffuse.path, &before), 0)
+        _ = try await project.snapshot(imageSize: 32)
+        _ = try await project.snapshot(imageSize: 32)
+        var after = stat(); XCTAssertEqual(lstat(diffuse.path, &after), 0)
+        var actual = Data(count: formatted.count)
+        XCTAssertEqual(actual.withUnsafeMutableBytes { getxattr(diffuse.path, key, $0.baseAddress, formatted.count, 0, 0) }, formatted.count)
+        XCTAssertEqual(actual, formatted)
+        XCTAssertEqual(before.st_ctimespec.tv_sec, after.st_ctimespec.tv_sec)
+        XCTAssertEqual(before.st_ctimespec.tv_nsec, after.st_ctimespec.tv_nsec)
+        var changed = tag; changed.role = "unknown"
+        try writeTag(changed, to: diffuse)
+        XCTAssertEqual(imageTag(diffuse)?.role, "unknown")
+    }
+
+    func testCompletionRecordWithoutPublishedAdapterKeepsCheckpointResumable() async throws {
+        let studio = try makeStudio(), source = try folder("Interrupted Publication")
+        let project = try WorkshopProject(sourceFolder: source, textureStudio: studio)
+        let run = project.projectFolder.appendingPathComponent("runs/interrupted", isDirectory: true)
+        let checkpoints = run.appendingPathComponent("checkpoints/category/depth", isDirectory: true)
+        try FileManager.default.createDirectory(at: checkpoints, withIntermediateDirectories: true)
+        let options = WorkshopOptions()
+        try JSONEncoder().encode(WorkshopRunRequest(options: options, baseID: "base", baseVersion: "1", sourceSignature: "source"))
+            .write(to: run.appendingPathComponent("request.json"))
+        func dictionary<T: Encodable>(_ value: T) throws -> [String: Any] {
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as! [String: Any]
+        }
+        let checkpoint: [String: Any] = ["schema": "loom-workshop-checkpoint-v3", "epoch": 1, "updates": 3,
+            "epoch_completed": true, "next_batch": 1, "epoch_order": [0], "base_id": "base", "base_version": "1",
+            "category_id": "category", "category_version": "1", "map": "depth", "base_sha256": "base",
+            "final_loss": 0.1, "options": try dictionary(options),
+            "weights_path": "adapter.safetensors", "optimizer_path": "optimizer.safetensors",
+            "weights_sha256": "adapter", "optimizer_sha256": "optimizer",
+            "sampling_state": try dictionary(NativeAugmentationPlan(seed: options.seed, cropRefresh: "per_epoch", augmentationRefresh: "per_epoch")),
+            "order_state": "1"]
+        try JSONSerialization.data(withJSONObject: checkpoint).write(to: checkpoints.appendingPathComponent("epoch-000001.json"))
+        try JSONSerialization.data(withJSONObject: ["status": "completed", "updates": 3]).write(to: run.appendingPathComponent("result.json"))
+        let saved = try await project.resumableRuns()
+        XCTAssertEqual(saved.map { $0.directory.resolvingSymlinksInPath().standardizedFileURL },
+                       [run.resolvingSymlinksInPath().standardizedFileURL])
+        XCTAssertEqual(saved.first?.updates, 3)
     }
 
     func testCurrentFolderMembershipAndRenameDetermineDatasets() async throws {
@@ -279,6 +354,74 @@ final class WorkshopProjectTests: XCTestCase, @unchecked Sendable {
         _ = try WorkshopProject.inspectStudio(at: studio)
         try Data("changed".utf8).write(to: studio.appendingPathComponent("Contents/Resources/TextureLoom/map.safetensors"))
         XCTAssertThrowsError(try WorkshopProject.inspectStudio(at: studio))
+    }
+
+    func testRepeatedOrEmptyModelMapsAreRejectedBeforeDatasetCounting() throws {
+        let studio = try makeStudio()
+        let file = studio.appendingPathComponent("Contents/Resources/TextureLoom/manifest.json")
+        var manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as! [String: Any]
+        var categories = manifest["categories"] as! [[String: Any]]
+        let model = (categories[0]["models"] as! [[String: Any]])[0]
+        for models in [[model, model], []] {
+            categories[0]["models"] = models; manifest["categories"] = categories
+            try JSONSerialization.data(withJSONObject: manifest).write(to: file)
+            XCTAssertThrowsError(try WorkshopProject.inspectStudio(at: studio))
+        }
+    }
+
+    func testIdleStudioInspectionReusesCatalogAndRejectsSameSizeChangesWithRestoredModificationDate() throws {
+        let studio = try makeStudio()
+        var cache = StudioInspectionCache(), inspections = 0
+        func inspect(_ application: URL) throws -> StudioBase {
+            inspections += 1
+            return try WorkshopProject.inspectStudio(at: application)
+        }
+        let initial = try cache.read(studio, inspect: inspect)
+        XCTAssertEqual(try cache.read(studio, inspect: inspect).modelID, initial.modelID)
+        XCTAssertEqual(inspections, 1, "Unchanged idle polls must not rehash tensors or reload the classifier")
+        let weights = studio.appendingPathComponent("Contents/Resources/TextureLoom/map.safetensors")
+        let original = try Data(contentsOf: weights)
+        let modified = try XCTUnwrap(try FileManager.default.attributesOfItem(atPath: weights.path)[.modificationDate] as? Date)
+        try Data(repeating: 120, count: original.count).write(to: weights)
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: weights.path)
+        XCTAssertThrowsError(try cache.read(studio, inspect: inspect))
+        XCTAssertThrowsError(try cache.read(studio, inspect: inspect), "A failed reinspection must not reuse a stale success")
+        XCTAssertEqual(inspections, 3)
+        try original.write(to: weights)
+        XCTAssertEqual(try cache.read(studio, inspect: inspect).modelID, initial.modelID)
+        XCTAssertEqual(inspections, 4)
+    }
+
+    func testStudioInspectionCacheDetectsAddedAndRemovedPackageFiles() throws {
+        let studio = try makeStudio()
+        var cache = StudioInspectionCache(), inspections = 0
+        func inspect(_ application: URL) throws -> StudioBase {
+            inspections += 1
+            return try WorkshopProject.inspectStudio(at: application)
+        }
+        _ = try cache.read(studio, inspect: inspect)
+        let added = studio.appendingPathComponent("Contents/Resources/TextureLoom/extra.native")
+        try Data("new artifact".utf8).write(to: added)
+        _ = try cache.read(studio, inspect: inspect)
+        XCTAssertEqual(inspections, 2)
+        try FileManager.default.removeItem(at: added)
+        _ = try cache.read(studio, inspect: inspect)
+        XCTAssertEqual(inspections, 3)
+    }
+
+    func testStudioInspectionDoesNotCacheUnobservedNestedLinkTargets() throws {
+        let studio = try makeStudio(), external = try folder("Linked Package Files")
+        let link = studio.appendingPathComponent("Contents/Resources/TextureLoom/external", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: external)
+        var cache = StudioInspectionCache(), inspections = 0
+        func inspect(_ application: URL) throws -> StudioBase {
+            inspections += 1
+            return try WorkshopProject.inspectStudio(at: application)
+        }
+        _ = try cache.read(studio, inspect: inspect)
+        try Data("changed linked contents".utf8).write(to: external.appendingPathComponent("file"))
+        _ = try cache.read(studio, inspect: inspect)
+        XCTAssertEqual(inspections, 2, "A directory link's unchanged lstat cannot prove its target stayed unchanged")
     }
 
     func testCurrentTargetCategoryCannotEnterAnotherDataset() async throws {
