@@ -1,6 +1,8 @@
 # Loom Workshop
 
-Loom Workshop trains a LoRA for the Texture Loom model built into your installed Texture Studio. It is a fresh, independent macOS app.
+Loom Workshop is a native macOS app that trains material LoRAs for the Texture Loom model built into your installed [Texture Studio](https://github.com/gnaservicesinc/Texture_Studio).
+
+Full model training, including experimental RGB noise repair and lighting correction, belongs to [Loom Factory](https://github.com/gnaservicesinc/LoomFactory). Workshop currently trains depth, roughness and normal adapters; photo cleanup adapters are not supported.
 
 Choose Texture Studio, then a folder containing diffuse images with matching depth, roughness, or normal maps. The installed classifier groups the images into datasets automatically. Train one dataset or all available datasets, then export a `.loomlora` file or install it in Texture Studio.
 
@@ -38,5 +40,3 @@ current sources explicitly.
 Native SwiftUI layout tests render the startup and populated workflow at the supported window sizes. These are view renderings; they do not certify trained texture quality. Assess a trained model on new materials before deploying it.
 
 The native LoRA graph freezes every installed convolution and bias. Only low-rank down/up tensors receive gradients. Exports include those adapter safetensors plus a fused Core ML model, checked against native inference before publishing the adapter manifest. Stop cancels a shared native token from the responsive project actor and returns after the current bounded GPU operation. CPU training settings saved by older versions are retained, but require selecting Apple GPU because this backend has no CPU trainer.
-
-For sibling-checkout development, set `LOOM_NATIVE_DEVELOPMENT_PATH` to the Loom Factory checkout that provides the `LoomNative` library.
